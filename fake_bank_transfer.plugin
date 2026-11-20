@@ -1,0 +1,3500 @@
+__id__ = "fake_bank_transfer"
+__name__ = "Fake Bank Transfer"
+__description__ = (
+    "Генератор переводов и квитанций для 🇷🇺 Сбера / 🇷🇺 Альфа-Банка / 🇷🇺 Т-Банка / "
+    "🇷🇺 Озон-Банка / 🇺🇦 Монобанка / Telegram Wallet / 🇧🇾 Приорбанка.\n"
+    "Создавать переводы нужно в настройках плагина."
+)
+__author__ = "@morkxdddd & @fixxeedd"
+__version__ = "2.0.0"
+__icon__ = "UtyaDuck/17"
+__min_version__ = "11.12.0"
+
+import random
+import threading
+from datetime import datetime
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Input, Selector, Text, Divider
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
+
+from android.app import Dialog
+from android.webkit import WebView
+from android.view import Window, ViewGroup, WindowManager, View
+from android.graphics import Color, Bitmap, Canvas
+from android.graphics.drawable import ColorDrawable
+from android.provider import MediaStore
+from android.content import ContentValues, Intent
+from android.net import Uri
+from android.widget import Toast, FrameLayout
+
+
+RU_MONTHS = [
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+]
+
+UA_MONTHS = [
+    "", "січня", "лютого", "березня", "квітня", "травня", "червня",
+    "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"
+]
+
+RANDOM_NAMES = [
+    "Александр М.", "Дмитрий К.", "Михаил П.", "Ильдар Г.",
+    "Артём В.", "Максим С.", "Екатерина Л.", "Анна Н.",
+    "Сергей Т.", "Иван Р.", "Никита Б.", "Елена Д.",
+    "Тимур Г."
+]
+
+RANDOM_FULL_NAMES = [
+    "Андрей Игоревич Л.", "Александр Сергеевич М.", "Дмитрий Андреевич К.",
+    "Михаил Павлович П.", "Артём Владимирович В.", "Максим Олегович С.",
+    "Екатерина Алексеевна Л.", "Анна Николаевна Н.", "Сергей Викторович Т."
+]
+
+RANDOM_SENDERS = [
+    "Олег Огренич", "Иван Смирнов", "Дмитрий Волков", "Алексей Морозов",
+    "Николай Соколов", "Максим Лебедев", "Сергей Новиков", "Артём Козлов"
+]
+
+
+def format_spaces(val: str, decimal_sep: str = ",") -> str:
+    """Автоматически расставляет пробелы между разрядами чисел."""
+    s = (
+        str(val)
+        .strip()
+        .lstrip("-")
+        .lstrip("–")
+        .replace("₽", "")
+        .replace("₴", "")
+        .replace(" ", "")
+        .replace("\u00a0", "")
+    )
+    if not s:
+        return "0"
+    sep = "," if "," in s else ("." if "." in s else None)
+    if sep:
+        parts = s.split(sep, 1)
+        int_part, frac_part = parts[0], parts[1]
+    else:
+        int_part, frac_part = s, None
+
+    digits = "".join(ch for ch in int_part if ch.isdigit())
+    if not digits:
+        return str(val).strip()
+
+    formatted_int = "{:,}".format(int(digits)).replace(",", " ")
+    if frac_part is not None:
+        return f"{formatted_int}{decimal_sep}{frac_part}"
+    return formatted_int
+
+
+def format_mono_amount(val: str) -> str:
+    """Форматирует сумму с точкой и двумя знаками после запятой."""
+    formatted = format_spaces(val, decimal_sep=".")
+    if "." not in formatted:
+        return f"{formatted}.00"
+    return formatted
+
+
+def format_tbank_receipt_card(raw_card: str) -> tuple:
+    """Возвращает (last4, отформатированную маску '2200 39** **** 7525')."""
+    clean = str(raw_card).replace(" ", "")
+    digits_only = "".join(ch for ch in clean if ch.isdigit())
+    last4 = digits_only[-4:] if len(digits_only) >= 4 else "7525"
+    first6 = digits_only[:6] if len(digits_only) >= 6 else "220039"
+    spaced_mask = f"{first6[:4]} {first6[4:6]}** **** {last4}"
+    return last4, spaced_mask
+
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Roboto", sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    html, body {
+      background-color: __BG_HEX__;
+      color: #ffffff;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      width: 100%;
+    }
+
+    body.no-anim *,
+    body.no-anim *::before,
+    body.no-anim *::after {
+      animation: none !important;
+      transition: none !important;
+      transform: none !important;
+    }
+
+    .app {
+      width: 100%;
+      max-width: 440px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    @keyframes fadeSlideUp {
+      0% { opacity: 0; transform: translateY(14px); }
+      100% { opacity: 1; transform: none; }
+    }
+
+    @keyframes popIn {
+      0% { opacity: 0; transform: scale(0.75); }
+      70% { transform: scale(1.04); }
+      100% { opacity: 1; transform: none; }
+    }
+
+    @keyframes sheetUp {
+      0% { opacity: 0; transform: translateY(28px); }
+      100% { opacity: 1; transform: none; }
+    }
+
+    #sber-screen, #alfa-screen, #tbank-screen, #tbank-receipt-screen, #tbank2-screen,
+    #ozon-screen, #ozon2-screen, #mono-screen, #wallet-screen, #prior-screen {
+      display: none;
+    }
+
+    .active-screen {
+      display: flex !important;
+    }
+
+    /* ================= 1: СБЕР ================= */
+    #sber-screen {
+      background-color: #111113;
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+      padding-top: 36px;
+    }
+
+    .sber-top {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 0 20px 28px;
+      flex-shrink: 0;
+    }
+
+    .sber-icon-wrap {
+      width: 136px;
+      height: 136px;
+      border-radius: 50%;
+      background: rgba(33, 160, 56, 0.12);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 22px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .sber-icon-mid {
+      width: 98px;
+      height: 98px;
+      border-radius: 50%;
+      background: rgba(33, 160, 56, 0.22);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .sber-icon-inner {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      background: #21a038;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .sber-amount {
+      font-size: 34px;
+      line-height: 1.2;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 10px;
+      flex-shrink: 0;
+      animation: fadeSlideUp 0.35s ease;
+    }
+
+    .sber-status {
+      font-size: 16px;
+      line-height: 1.3;
+      color: #e0e0e0;
+      margin-bottom: 28px;
+      flex-shrink: 0;
+      animation: fadeSlideUp 0.38s ease;
+    }
+
+    .sber-actions {
+      display: flex;
+      gap: 12px;
+      width: 100%;
+      max-width: 340px;
+      flex-shrink: 0;
+      animation: fadeSlideUp 0.42s ease;
+    }
+
+    .sber-action-card {
+      flex: 1;
+      min-height: 64px;
+      background: #221f26;
+      border-radius: 14px;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    .sber-action-text {
+      font-size: 15px;
+      line-height: 1.25;
+      color: #f0f0f0;
+      font-weight: 500;
+    }
+
+    .sber-bottom-sheet {
+      background: #1d1a22;
+      border-radius: 22px 22px 0 0;
+      flex: 1;
+      padding: 10px 20px 30px;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .sber-handle {
+      width: 36px;
+      height: 4px;
+      background: #706d76;
+      border-radius: 2px;
+      margin: 0 auto 22px;
+    }
+
+    .sber-info-title {
+      font-size: 17px;
+      line-height: 1.35;
+      color: #f2f2f2;
+      margin-bottom: 8px;
+    }
+
+    .sber-info-sub {
+      font-size: 14px;
+      line-height: 1.4;
+      color: #8c8894;
+      margin-bottom: 22px;
+    }
+
+    .sber-divider {
+      height: 2px;
+      background: #121015;
+      margin: 0 -20px 22px;
+    }
+
+    .sber-details-header {
+      font-size: 21px;
+      font-weight: 700;
+      margin-bottom: 24px;
+    }
+
+    .sber-card-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 18px;
+      border-bottom: 2px dotted #4a4652;
+    }
+
+    .sber-card-label {
+      font-size: 14px;
+      color: #8c8894;
+      margin-bottom: 6px;
+    }
+
+    .sber-card-number {
+      font-size: 17px;
+      font-weight: 500;
+      letter-spacing: 0.5px;
+    }
+
+    body.theme-light #sber-screen { background-color: #f3f4f6; color: #141416; }
+    body.theme-light .sber-status { color: #55555c; }
+    body.theme-light .sber-action-card { background: #ffffff; box-shadow: 0 2px 10px rgba(0,0,0,0.04); }
+    body.theme-light .sber-action-text { color: #141416; }
+    body.theme-light .sber-bottom-sheet { background: #ffffff; box-shadow: 0 -4px 16px rgba(0,0,0,0.04); }
+    body.theme-light .sber-handle { background: #d0d0d6; }
+    body.theme-light .sber-info-title { color: #141416; }
+    body.theme-light .sber-info-sub { color: #76747e; }
+    body.theme-light .sber-divider { background: #f0f0f4; }
+    body.theme-light .sber-card-row { border-bottom-color: #d0cfd6; }
+
+    /* ================= 2: АЛЬФА-БАНК ================= */
+    #alfa-screen {
+      background-color: #0b0b0c;
+      background-image:
+        radial-gradient(circle at 26% 68%, rgba(75, 62, 32, 0.24) 0%, rgba(0, 0, 0, 0) 48%),
+        radial-gradient(circle at 50% 42%, rgba(35, 42, 68, 0.28) 0%, rgba(0, 0, 0, 0) 52%);
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+      padding: 20px 18px 22px;
+      justify-content: space-between;
+    }
+
+    .alfa-topbar {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 46px;
+      flex-shrink: 0;
+    }
+
+    .alfa-close-btn {
+      position: absolute;
+      left: 6px;
+      top: 10px;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .alfa-top-title {
+      font-size: 16.5px;
+      font-weight: 700;
+      color: #ffffff;
+      line-height: 1.25;
+      margin-bottom: 3px;
+      letter-spacing: -0.1px;
+    }
+
+    .alfa-top-sub {
+      font-size: 13.5px;
+      font-weight: 400;
+      color: #8c8c91;
+      line-height: 1.2;
+    }
+
+    .alfa-center-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+      padding: 0 6px;
+      margin: auto 0;
+    }
+
+    .alfa-icon-box {
+      position: relative;
+      width: 80px;
+      height: 80px;
+      border-radius: 24px;
+      background: #005bff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 4;
+      margin-bottom: -42px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .alfa-ozon-svg {
+      width: 66px;
+      height: 28px;
+      transform: rotate(-17deg);
+    }
+
+    .alfa-sbp-badge {
+      position: absolute;
+      right: -3px;
+      bottom: -3px;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+    }
+
+    .alfa-main-card {
+      width: 100%;
+      background-color: #212122;
+      border-radius: 24px;
+      padding: 58px 20px 26px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      position: relative;
+      z-index: 3;
+      animation: fadeSlideUp 0.38s ease;
+    }
+
+    .alfa-amount-text {
+      font-size: 31px;
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: -0.4px;
+      line-height: 1.15;
+      margin-bottom: 8px;
+    }
+
+    .alfa-fee-text {
+      font-size: 14px;
+      font-weight: 400;
+      color: #8c8c91;
+      margin-bottom: 22px;
+    }
+
+    .alfa-recipient-text {
+      font-size: 17px;
+      font-weight: 700;
+      color: #ffffff;
+      line-height: 1.3;
+      margin-bottom: 8px;
+    }
+
+    .alfa-sbp-desc {
+      font-size: 14.5px;
+      line-height: 1.38;
+      color: #8c8c91;
+      max-width: 265px;
+    }
+
+    .alfa-history-card {
+      width: 100%;
+      background-color: #161617;
+      border-radius: 0 0 24px 24px;
+      margin-top: -22px;
+      padding: 40px 18px 20px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: relative;
+      z-index: 2;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .alfa-hand-emoji {
+      font-size: 20px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+
+    .alfa-history-text {
+      flex: 1;
+      font-size: 14px;
+      line-height: 1.36;
+      color: #e2e2e7;
+      text-align: left;
+    }
+
+    .alfa-done-btn {
+      width: 100%;
+      height: 54px;
+      background-color: #212122;
+      color: #ffffff;
+      border: none;
+      border-radius: 16px;
+      font-size: 16.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    body.theme-light #alfa-screen {
+      background-color: #f2f3f7;
+      background-image: none;
+      color: #141416;
+    }
+    body.theme-light .alfa-top-title,
+    body.theme-light .alfa-amount-text,
+    body.theme-light .alfa-recipient-text {
+      color: #141416;
+    }
+    body.theme-light .alfa-main-card {
+      background-color: #ffffff;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
+    }
+    body.theme-light .alfa-history-card {
+      background-color: #e6e8ef;
+    }
+    body.theme-light .alfa-history-text {
+      color: #2c2c2e;
+    }
+    body.theme-light .alfa-done-btn {
+      background-color: #e4e6ed;
+      color: #141416;
+    }
+
+    /* ================= 3 и 4: Т-БАНК ================= */
+    #tbank-screen {
+      background: linear-gradient(180deg, #ffffff 0%, #ffffff 390px, #f5f6f8 430px, #f5f6f8 100%);
+      color: #212124;
+      flex: 1;
+      flex-direction: column;
+      padding: 34px 16px 30px;
+    }
+
+    #tbank2-screen {
+      background: linear-gradient(180deg, #ffffff 0%, #ffffff 380px, #f5f6f8 420px, #f5f6f8 100%);
+      color: #212124;
+      flex: 1;
+      flex-direction: column;
+      padding: 14px 16px 30px;
+    }
+
+    .tbank2-header {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 36px;
+      margin-bottom: 20px;
+      flex-shrink: 0;
+    }
+
+    .tbank2-date {
+      font-size: 16px;
+      font-weight: 500;
+      color: #212124;
+      text-align: center;
+    }
+
+    .tbank2-close {
+      position: absolute;
+      right: 0;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: #f2f3f5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .tbank-top {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin-bottom: 24px;
+      flex-shrink: 0;
+    }
+
+    .tbank-logo {
+      width: 88px;
+      height: 88px;
+      border-radius: 50%;
+      background: #ffdd2d;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 18px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .alfa-logo {
+      width: 88px;
+      height: 88px;
+      border-radius: 50%;
+      background: #ef3124;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 18px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .tbank-name {
+      font-size: 18px;
+      font-weight: 500;
+      color: #212124;
+      text-align: center;
+      margin-bottom: 4px;
+      animation: fadeSlideUp 0.35s ease;
+    }
+
+    .tbank-category {
+      font-size: 14px;
+      color: #898f97;
+      text-align: center;
+      margin-bottom: 18px;
+      animation: fadeSlideUp 0.38s ease;
+    }
+
+    .tbank-amount {
+      font-size: 35px;
+      font-weight: 700;
+      color: #212124;
+      text-align: center;
+      letter-spacing: -0.5px;
+      margin-bottom: 16px;
+      animation: fadeSlideUp 0.4s ease;
+    }
+
+    .tbank2-amount {
+      font-size: 35px;
+      font-weight: 700;
+      color: #212124;
+      text-align: center;
+      letter-spacing: -0.5px;
+      margin-bottom: 24px;
+      animation: fadeSlideUp 0.4s ease;
+    }
+
+    .tbank-status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      font-size: 14px;
+      color: #898f97;
+      margin-bottom: 20px;
+      animation: fadeSlideUp 0.42s ease;
+    }
+
+    .tbank-actions {
+      display: flex;
+      gap: 10px;
+      width: 100%;
+      max-width: 340px;
+      justify-content: center;
+      flex-shrink: 0;
+      animation: fadeSlideUp 0.44s ease;
+    }
+
+    .tbank2-actions {
+      display: flex;
+      gap: 8px;
+      width: 100%;
+      justify-content: center;
+      flex-shrink: 0;
+      animation: fadeSlideUp 0.44s ease;
+    }
+
+    .tbank-action-btn {
+      flex: 1;
+      background: #f1f5fb;
+      border-radius: 14px;
+      padding: 12px 6px 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 7px;
+      font-size: 13px;
+      color: #5b697c;
+      flex-shrink: 0;
+    }
+
+    .tbank2-action-btn {
+      flex: 1;
+      background: #f1f5fb;
+      border-radius: 14px;
+      padding: 12px 2px 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      color: #5b697c;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .tbank-card {
+      background: #ffffff;
+      border-radius: 22px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.05);
+      flex-shrink: 0;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .tbank-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .tbank-card-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: #212124;
+    }
+
+    .tbank-card-link {
+      font-size: 16px;
+      color: #428bf9;
+    }
+
+    .tbank-account-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .tbank-ruble-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: #428bf9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .tbank-ruble-inner {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #ffffff;
+      color: #428bf9;
+      font-size: 14px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .tbank-account-info { flex: 1; }
+
+    .tbank-account-name {
+      font-size: 16px;
+      color: #212124;
+      margin-bottom: 3px;
+    }
+
+    .tbank2-account-name {
+      font-size: 16px;
+      color: #212124;
+    }
+
+    .tbank-account-balance {
+      font-size: 14px;
+      color: #898f97;
+    }
+
+    .tbank-chevron {
+      color: #b5bac1;
+      font-size: 18px;
+    }
+
+    .tbank-req-label {
+      font-size: 14px;
+      color: #898f97;
+      margin-top: 14px;
+      margin-bottom: 5px;
+    }
+
+    .tbank-req-val {
+      font-size: 16px;
+      color: #212124;
+    }
+
+    body.theme-dark #tbank-screen,
+    body.theme-dark #tbank2-screen {
+      background: #0f1012;
+      color: #ffffff;
+    }
+    body.theme-dark .tbank2-date,
+    body.theme-dark .tbank-name,
+    body.theme-dark .tbank-amount,
+    body.theme-dark .tbank2-amount,
+    body.theme-dark .tbank-card-title,
+    body.theme-dark .tbank-account-name,
+    body.theme-dark .tbank2-account-name,
+    body.theme-dark .tbank-req-val {
+      color: #ffffff;
+    }
+    body.theme-dark .tbank2-close { background: #23252c; }
+    body.theme-dark .tbank-action-btn,
+    body.theme-dark .tbank2-action-btn {
+      background: #1c1e24;
+      color: #9ba3b0;
+    }
+    body.theme-dark .tbank-card {
+      background: #1c1e24;
+      box-shadow: none;
+    }
+
+    /* ================= 3B: КВИТАНЦИЯ Т-БАНК (1) ================= */
+    #tbank-receipt-screen {
+      background-color: #ffffff;
+      color: #191c1f;
+      flex: 1;
+      flex-direction: column;
+      padding: 28px 24px 32px;
+    }
+
+    .tbr-shield-wrap {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 32px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .tbr-date {
+      font-size: 14.5px;
+      color: #8c939b;
+      margin-bottom: 8px;
+      font-weight: 400;
+    }
+
+    .tbr-total-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 22px;
+    }
+
+    .tbr-total-label {
+      font-size: 26px;
+      font-weight: 700;
+      color: #191c1f;
+      letter-spacing: -0.3px;
+    }
+
+    .tbr-total-val {
+      font-size: 26px;
+      font-weight: 700;
+      color: #191c1f;
+      letter-spacing: -0.3px;
+    }
+
+    .tbr-yellow-line {
+      height: 2px;
+      background-color: #ffdd2d;
+      width: 100%;
+      margin-bottom: 24px;
+      flex-shrink: 0;
+    }
+
+    .tbr-rows {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      margin-bottom: 26px;
+    }
+
+    .tbr-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+    }
+
+    .tbr-key {
+      font-size: 15.5px;
+      color: #4d5359;
+      flex-shrink: 0;
+    }
+
+    .tbr-val {
+      font-size: 15.5px;
+      color: #191c1f;
+      text-align: right;
+      line-height: 1.38;
+      font-weight: 400;
+    }
+
+    .tbr-stamp-area {
+      position: relative;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      padding-right: 4px;
+      margin: 8px 0 28px;
+      min-height: 98px;
+    }
+
+    .tbr-stamp-box {
+      border: 1.8px solid #1862ab;
+      padding: 9px 14px;
+      text-align: center;
+      color: #1862ab;
+      width: 248px;
+      background: rgba(255, 255, 255, 0.9);
+      position: relative;
+    }
+
+    .tbr-stamp-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      margin-bottom: 4px;
+    }
+
+    .tbr-stamp-line {
+      font-size: 10.5px;
+      font-weight: 700;
+      line-height: 1.32;
+    }
+
+    .tbr-signature-svg {
+      position: absolute;
+      right: 175px;
+      bottom: 4px;
+      width: 145px;
+      height: 62px;
+      pointer-events: none;
+    }
+
+    .tbr-footer {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 2px;
+    }
+
+    .tbr-receipt-num {
+      font-size: 15px;
+      color: #3a3f45;
+    }
+
+    .tbr-footer-note {
+      font-size: 14.5px;
+      color: #8c939b;
+      line-height: 1.35;
+    }
+
+    .tbr-support {
+      font-size: 14.5px;
+      color: #707780;
+    }
+
+    /* Тёмная тема для квитанции Т-Банка */
+    body.theme-dark #tbank-receipt-screen {
+      background-color: #141518;
+      color: #f3f4f6;
+    }
+    body.theme-dark .tbr-total-label,
+    body.theme-dark .tbr-total-val,
+    body.theme-dark .tbr-val {
+      color: #f3f4f6;
+    }
+    body.theme-dark .tbr-key,
+    body.theme-dark .tbr-receipt-num {
+      color: #adb3bc;
+    }
+    body.theme-dark .tbr-stamp-box {
+      background: rgba(20, 21, 24, 0.85);
+      border-color: #4d94db;
+      color: #4d94db;
+    }
+
+    /* ================= 5: ОЗОН БАНК ================= */
+    #ozon-screen {
+      background-color: #0f1115;
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .ozon-card-top {
+      background: #181b20;
+      border-radius: 0 0 22px 22px;
+      padding: 40px 20px 30px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .ozon-check-wrap {
+      position: relative;
+      width: 78px;
+      height: 78px;
+      border-radius: 50%;
+      background: #1e2633;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 22px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .ozon-badge {
+      position: absolute;
+      top: -10px;
+      right: -12px;
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: #005bff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: 800;
+      line-height: 1.05;
+      color: #fff;
+      text-align: center;
+    }
+
+    .ozon-title {
+      font-size: 19px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      animation: fadeSlideUp 0.35s ease;
+    }
+
+    .ozon-subtitle {
+      font-size: 15px;
+      color: #8c939e;
+      margin-bottom: 20px;
+      text-align: center;
+      animation: fadeSlideUp 0.38s ease;
+    }
+
+    .ozon-amount {
+      font-size: 33px;
+      font-weight: 800;
+      text-align: center;
+      animation: fadeSlideUp 0.4s ease;
+    }
+
+    .ozon-card-mid {
+      background: #181b20;
+      border-radius: 22px;
+      padding: 10px 20px;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      animation: sheetUp 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .ozon-menu-item {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 18px 0;
+      font-size: 16px;
+      color: #f0f2f5;
+    }
+
+    .ozon-card-bottom {
+      background: #181b20;
+      border-radius: 22px 22px 0 0;
+      padding: 24px 20px 28px;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      animation: sheetUp 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .ozon-section-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 18px;
+    }
+
+    .ozon-field { margin-bottom: 18px; }
+
+    .ozon-field-label {
+      font-size: 13px;
+      color: #8c939e;
+      margin-bottom: 4px;
+    }
+
+    .ozon-field-value {
+      font-size: 16px;
+      color: #ffffff;
+    }
+
+    .ozon-main-btn {
+      margin-top: auto;
+      background: #3382ff;
+      color: #ffffff;
+      border: none;
+      border-radius: 16px;
+      height: 52px;
+      font-size: 16px;
+      font-weight: 600;
+      width: 100%;
+      flex-shrink: 0;
+    }
+
+    body.theme-light #ozon-screen { background-color: #f0f2f5; color: #001a34; }
+    body.theme-light .ozon-card-top,
+    body.theme-light .ozon-card-mid,
+    body.theme-light .ozon-card-bottom { background: #ffffff; }
+    body.theme-light .ozon-check-wrap { background: #e8f1ff; }
+    body.theme-light .ozon-menu-item { color: #001a34; }
+    body.theme-light .ozon-field-value { color: #001a34; }
+
+    /* ================= 6: ОЗОН БАНК (2) ================= */
+    #ozon2-screen {
+      background-color: #08192e;
+      background-image:
+        radial-gradient(circle at 46% 24%, rgba(44, 150, 96, 0.72) 0%, rgba(20, 88, 75, 0.46) 32%, rgba(8, 25, 46, 0) 68%),
+        linear-gradient(180deg, #0d2942 0%, #0b2239 48%, #08192e 100%);
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+      padding: 14px 16px 22px;
+    }
+
+    .ozon2-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 44px;
+      padding: 0 2px;
+      flex-shrink: 0;
+    }
+
+    .ozon2-topbar-title {
+      font-size: 15.5px;
+      font-weight: 500;
+      color: #b7c7d6;
+      text-align: center;
+    }
+
+    .ozon2-close-btn {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: rgba(145, 168, 188, 0.36);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .ozon2-ticket-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 100%;
+      margin-top: 52px;
+      margin-bottom: 24px;
+    }
+
+    .ozon2-sber-box {
+      position: relative;
+      width: 78px;
+      height: 78px;
+      border-radius: 22px;
+      background: #08a629;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 4;
+      margin-bottom: -39px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .ozon2-sber-check {
+      position: absolute;
+      right: -5px;
+      bottom: -5px;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: #19b83b;
+      border: 3px solid #1a1e23;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .ozon2-card {
+      width: 100%;
+      background-color: #1a1e23;
+      border-radius: 22px;
+      padding: 50px 0 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+      z-index: 3;
+      overflow: hidden;
+      animation: fadeSlideUp 0.38s ease;
+    }
+
+    .ozon2-status {
+      font-size: 19px;
+      font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 6px;
+    }
+
+    .ozon2-amount {
+      font-size: 29px;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: -0.3px;
+      margin-bottom: 18px;
+    }
+
+    .ozon2-divider-wrap {
+      width: 100%;
+      height: 26px;
+      position: relative;
+      display: flex;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .ozon2-notch-left {
+      position: absolute;
+      left: -13px;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background-color: #15494b;
+    }
+
+    .ozon2-notch-right {
+      position: absolute;
+      right: -13px;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background-color: #103944;
+    }
+
+    .ozon2-dashed-line {
+      width: 100%;
+      margin: 0 20px;
+      border-top: 2px dashed #344753;
+    }
+
+    .ozon2-cat-pill {
+      background-color: #25292e;
+      border-radius: 18px;
+      padding: 7px 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+
+    .ozon2-cat-ruble {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background-color: #2994ff;
+      color: #1a1e23;
+      font-size: 11px;
+      font-weight: 800;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .ozon2-cat-text {
+      font-size: 15px;
+      font-weight: 500;
+      color: #ffffff;
+    }
+
+    .ozon2-bank-label {
+      font-size: 15px;
+      color: #8a9199;
+      margin-bottom: 8px;
+    }
+
+    .ozon2-recipient {
+      font-size: 17px;
+      font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 10px;
+      text-align: center;
+      padding: 0 16px;
+    }
+
+    .ozon2-phone {
+      font-size: 17px;
+      font-weight: 700;
+      color: #ffffff;
+      text-align: center;
+    }
+
+    .ozon2-promo-card {
+      width: 100%;
+      background-color: #2b3748;
+      border-radius: 0 0 22px 22px;
+      margin-top: -20px;
+      padding: 36px 18px 16px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      position: relative;
+      z-index: 2;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .ozon2-promo-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, #ffffff 0%, #b8c6db 55%, #7c65a9 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 900;
+      color: #2b3748;
+      flex-shrink: 0;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+    }
+
+    .ozon2-promo-text {
+      flex: 1;
+      font-size: 15px;
+      line-height: 1.32;
+      color: #ffffff;
+    }
+
+    .ozon2-actions-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      width: calc(100% + 16px);
+      margin-right: -16px;
+      padding-left: 8px;
+      overflow: hidden;
+      margin-bottom: 24px;
+      animation: fadeSlideUp 0.44s ease;
+    }
+
+    .ozon2-action-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 72px;
+      flex-shrink: 0;
+    }
+
+    .ozon2-action-box {
+      width: 52px;
+      height: 52px;
+      border-radius: 16px;
+      background-color: #121c26;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 8px;
+    }
+
+    .ozon2-action-label {
+      font-size: 12px;
+      color: #dbe4ed;
+      white-space: nowrap;
+      text-align: center;
+    }
+
+    .ozon2-done-btn {
+      margin-top: auto;
+      width: 100%;
+      height: 54px;
+      border-radius: 16px;
+      background-color: #005bff;
+      color: #ffffff;
+      border: none;
+      font-size: 17px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    body.theme-light #ozon2-screen {
+      background-color: #eef2f7;
+      background-image: radial-gradient(circle at 46% 24%, rgba(44, 180, 106, 0.22) 0%, rgba(238, 242, 247, 0) 65%);
+      color: #141416;
+    }
+    body.theme-light .ozon2-topbar-title { color: #4a5568; }
+    body.theme-light .ozon2-card { background-color: #ffffff; box-shadow: 0 4px 18px rgba(0,0,0,0.05); }
+    body.theme-light .ozon2-sber-check { border-color: #ffffff; }
+    body.theme-light .ozon2-status,
+    body.theme-light .ozon2-amount,
+    body.theme-light .ozon2-recipient,
+    body.theme-light .ozon2-phone,
+    body.theme-light .ozon2-cat-text { color: #141416; }
+    body.theme-light .ozon2-cat-pill { background-color: #f0f2f5; }
+    body.theme-light .ozon2-cat-ruble { color: #ffffff; }
+    body.theme-light .ozon2-notch-left,
+    body.theme-light .ozon2-notch-right { background-color: #e4f0ec; }
+    body.theme-light .ozon2-dashed-line { border-top-color: #d0d7de; }
+    body.theme-light .ozon2-promo-card { background-color: #dce4f0; }
+    body.theme-light .ozon2-promo-text { color: #141416; }
+    body.theme-light .ozon2-action-box { background-color: #ffffff; }
+    body.theme-light .ozon2-action-label { color: #2c3748; }
+
+    /* ================= 7: МОНОБАНК ================= */
+    #mono-screen {
+      background-color: #18171c;
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+    }
+
+    .mono-banner {
+      background-color: #4e47a6;
+      height: 82px;
+      width: 100%;
+      position: relative;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .mono-pattern {
+      width: 100%;
+      height: 100%;
+      opacity: 0.22;
+    }
+
+    .mono-top-section {
+      background-color: #232325;
+      border-radius: 22px 22px 0 0;
+      margin-top: -18px;
+      padding: 0 20px 34px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+      z-index: 2;
+      border-bottom: 1px solid #2d2d30;
+      flex-shrink: 0;
+    }
+
+    .mono-avatar {
+      width: 78px;
+      height: 78px;
+      border-radius: 50%;
+      background-color: #3f3897;
+      margin-top: -39px;
+      margin-bottom: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .mono-card-num {
+      font-size: 17px;
+      font-weight: 600;
+      color: #ffffff;
+      letter-spacing: 0.3px;
+      margin-bottom: 14px;
+      animation: fadeSlideUp 0.35s ease;
+    }
+
+    .mono-pill {
+      background-color: #423b9d;
+      border-radius: 20px;
+      padding: 7px 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      color: #ffffff;
+      margin-bottom: 18px;
+      animation: fadeSlideUp 0.38s ease;
+    }
+
+    .mono-date {
+      font-size: 14px;
+      color: #9b9b9e;
+      margin-bottom: 18px;
+      animation: fadeSlideUp 0.4s ease;
+    }
+
+    .mono-amount {
+      font-size: 42px;
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: -0.5px;
+      animation: fadeSlideUp 0.42s ease;
+    }
+
+    .mono-bottom-section {
+      padding: 20px 18px 30px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      flex: 1;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .mono-invite-card {
+      background:
+        linear-gradient(#242426, #242426) padding-box,
+        linear-gradient(90deg, #8b3fd9 0%, #e02b70 100%) border-box;
+      border: 2px solid transparent;
+      border-radius: 16px;
+      padding: 20px 18px 22px;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .mono-invite-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #f03276 0%, #c81e68 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      align-self: center;
+      margin-bottom: 16px;
+      flex-shrink: 0;
+    }
+
+    .mono-invite-text {
+      font-size: 17px;
+      line-height: 1.35;
+      color: #ffffff;
+      font-weight: 400;
+    }
+
+    .mono-row-card {
+      background-color: #242426;
+      border-radius: 16px;
+      padding: 18px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-shrink: 0;
+    }
+
+    .mono-tags-text {
+      font-size: 15px;
+      color: #9b9b9e;
+    }
+
+    .mono-wallet-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background-color: #4942a4;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .mono-balance-info {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .mono-balance-label {
+      font-size: 14px;
+      color: #9b9b9e;
+    }
+
+    .mono-balance-val {
+      font-size: 16px;
+      font-weight: 500;
+      color: #ffffff;
+    }
+
+    body.theme-light #mono-screen { background-color: #f2f3f7; color: #18171c; }
+    body.theme-light .mono-top-section { background-color: #ffffff; border-bottom-color: #e6e6eb; }
+    body.theme-light .mono-card-num,
+    body.theme-light .mono-amount,
+    body.theme-light .mono-invite-text,
+    body.theme-light .mono-balance-val { color: #18171c; }
+    body.theme-light .mono-invite-card {
+      background:
+        linear-gradient(#ffffff, #ffffff) padding-box,
+        linear-gradient(90deg, #8b3fd9 0%, #e02b70 100%) border-box;
+    }
+    body.theme-light .mono-row-card { background-color: #ffffff; }
+
+    /* ================= 8: TELEGRAM WALLET ================= */
+    #wallet-screen {
+      background-color: #000000;
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+      padding: 0 14px 30px;
+    }
+
+    .wallet-topbar {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 4px;
+      margin-bottom: 8px;
+      flex-shrink: 0;
+    }
+
+    .wallet-topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      min-width: 0;
+    }
+
+    .wallet-topbar-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .wallet-topbar-title {
+      font-size: 19px;
+      font-weight: 600;
+      color: #ffffff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .wallet-topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      flex-shrink: 0;
+    }
+
+    .wallet-card {
+      background-color: #1c1c1e;
+      border-radius: 16px;
+      padding: 20px 18px;
+      margin-bottom: 14px;
+      flex-shrink: 0;
+      animation: fadeSlideUp 0.35s ease;
+    }
+
+    .wallet-card-details {
+      background-color: #1c1c1e;
+      border-radius: 16px;
+      padding: 20px 18px 22px;
+      flex-shrink: 0;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .wallet-sent-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .wallet-up-circle {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: linear-gradient(180deg, #5ec2f7 0%, #3b96e6 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .wallet-sent-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #ffffff;
+    }
+
+    .wallet-amount-row {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .wallet-amount-val {
+      font-size: 36px;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: -0.5px;
+    }
+
+    .wallet-amount-token {
+      font-size: 24px;
+      font-weight: 700;
+      color: #7d7d82;
+      text-transform: uppercase;
+    }
+
+    .wallet-date {
+      font-size: 15px;
+      color: #7d7d82;
+    }
+
+    .wallet-details-header {
+      font-size: 16px;
+      font-weight: 600;
+      color: #4ea4f5;
+      margin-bottom: 18px;
+    }
+
+    .wallet-field {
+      margin-bottom: 18px;
+    }
+
+    .wallet-field-label {
+      font-size: 14px;
+      color: #7d7d82;
+      margin-bottom: 4px;
+    }
+
+    .wallet-field-val {
+      font-size: 16px;
+      color: #ffffff;
+    }
+
+    .wallet-address-val {
+      font-family: "Roboto Mono", "SF Mono", monospace;
+      font-size: 15.5px;
+      line-height: 1.38;
+      color: #ffffff;
+      word-break: break-all;
+    }
+
+    .wallet-explorer-link {
+      font-size: 16px;
+      color: #4ea4f5;
+      margin-top: 4px;
+    }
+
+    body.theme-light #wallet-screen { background-color: #f2f2f7; color: #000000; }
+    body.theme-light .wallet-topbar-title,
+    body.theme-light .wallet-sent-title,
+    body.theme-light .wallet-amount-val,
+    body.theme-light .wallet-field-val,
+    body.theme-light .wallet-address-val { color: #000000; }
+    body.theme-light .wallet-card,
+    body.theme-light .wallet-card-details { background-color: #ffffff; }
+    body.theme-light .wallet-icon-stroke { stroke: #000000; }
+    body.theme-light .wallet-icon-fill { fill: #000000; }
+
+    /* ================= 9: ПРИОРБАНК (PRIOR ONLINE) ================= */
+    #prior-screen {
+      background-color: #18191c;
+      color: #ffffff;
+      flex: 1;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 16px 20px 24px;
+      box-sizing: border-box;
+    }
+
+    .prior-topbar {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .prior-title {
+      font-size: 20px;
+      font-weight: 600;
+      color: #f1f2f4;
+      letter-spacing: -0.2px;
+    }
+
+    .prior-center {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      margin: auto 0;
+    }
+
+    .prior-icon-wrap {
+      width: 148px;
+      height: 148px;
+      border-radius: 50%;
+      background: rgba(46, 174, 78, 0.12);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 34px;
+      flex-shrink: 0;
+      animation: popIn 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .prior-icon-inner {
+      width: 114px;
+      height: 114px;
+      border-radius: 50%;
+      background: #2eae4e;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 8px 24px rgba(46, 174, 78, 0.28);
+    }
+
+    .prior-desc {
+      font-size: 17px;
+      line-height: 1.35;
+      color: #a4a7ae;
+      margin-bottom: 10px;
+      font-weight: 400;
+      max-width: 330px;
+      animation: fadeSlideUp 0.35s ease;
+    }
+
+    .prior-amount {
+      font-size: 26px;
+      font-weight: 800;
+      color: #ffffff;
+      letter-spacing: -0.2px;
+      animation: fadeSlideUp 0.4s ease;
+    }
+
+    .prior-bottom {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      width: 100%;
+      flex-shrink: 0;
+      animation: sheetUp 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .prior-btn-receipt {
+      width: 100%;
+      height: 52px;
+      background-color: #fec32d;
+      color: #141416;
+      border: none;
+      border-radius: 26px;
+      font-size: 16.5px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .prior-btn-close {
+      width: 100%;
+      height: 48px;
+      background: transparent;
+      color: #ffffff;
+      border: none;
+      font-size: 16.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    body.theme-light #prior-screen {
+      background-color: #f7f8fa;
+      color: #16181b;
+    }
+    body.theme-light .prior-title {
+      color: #16181b;
+    }
+    body.theme-light .prior-desc {
+      color: #6a6f7a;
+    }
+    body.theme-light .prior-amount {
+      color: #16181b;
+    }
+    body.theme-light .prior-btn-close {
+      color: #16181b;
+    }
+  </style>
+</head>
+<body class="__THEME_CLASS__">
+
+  <div class="app">
+
+    <!-- ЭКРАН 1: СБЕР -->
+    <div id="sber-screen" class="__SBER_ACTIVE__">
+      <div class="sber-top">
+        <div class="sber-icon-wrap">
+          <div class="sber-icon-mid">
+            <div class="sber-icon-inner">
+              <svg width="30" height="22" viewBox="0 0 30 22" fill="none">
+                <path d="M2.5 11.5L10.5 19.5L27.5 2.5" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="sber-amount">__AMOUNT__ ₽</div>
+        <div class="sber-status">Перевод выполнен</div>
+
+        <div class="sber-actions">
+          <div class="sber-action-card">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+              <path d="M20 11A8.1 8.1 0 0 0 4.5 9M4 5v4h4M4 13a8.1 8.1 0 0 0 15.5 2" stroke="#21a038" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <div class="sber-action-text">Повторить<br>перевод</div>
+          </div>
+
+          <div class="sber-action-card">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+              <rect x="5" y="3" width="14" height="18" rx="2" stroke="#21a038" stroke-width="2"/>
+              <line x1="8" y1="8" x2="16" y2="8" stroke="#21a038" stroke-width="2" stroke-linecap="round"/>
+              <line x1="8" y1="12" x2="16" y2="12" stroke="#21a038" stroke-width="2" stroke-linecap="round"/>
+              <line x1="8" y1="16" x2="13" y2="16" stroke="#21a038" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+            <div class="sber-action-text">Сохранить<br>чек</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sber-bottom-sheet">
+        <div class="sber-handle"></div>
+        <div class="sber-info-title">Перевод зачислится в течение<br>нескольких минут</div>
+        <div class="sber-info-sub">В редких случаях срок зачисления<br>увеличивается до нескольких дней</div>
+        <div class="sber-divider"></div>
+        <div class="sber-details-header">Подробности</div>
+        <div class="sber-card-row">
+          <div style="flex: 1;">
+            <div class="sber-card-label">Номер карты получателя</div>
+            <div class="sber-card-number">•• __LAST4__</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 2: АЛЬФА-БАНК -->
+    <div id="alfa-screen" class="__ALFA_ACTIVE__">
+      <div class="alfa-topbar">
+        <div class="alfa-close-btn">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M1.5 1.5L14.5 14.5M14.5 1.5L1.5 14.5" stroke="#9a9a9e" stroke-width="1.9" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="alfa-top-title">Перевод выполнен</div>
+        <div class="alfa-top-sub">Счёт списания ··__ALFA_ACCOUNT__</div>
+      </div>
+
+      <div class="alfa-center-wrap">
+        <div class="alfa-icon-box">
+          <svg class="alfa-ozon-svg" viewBox="0 0 132 36" fill="none">
+            <ellipse cx="16" cy="18" rx="11.5" ry="11.5" stroke="white" stroke-width="6.5"/>
+            <path d="M35 8.5H56L37.5 27.5H57.5" stroke="white" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <rect x="65" y="6.5" width="30" height="23" rx="11.5" stroke="white" stroke-width="6.5"/>
+            <path d="M104 28V8L124 28V8" stroke="white" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <div class="alfa-sbp-badge">
+            <svg width="20" height="20" viewBox="18 14 64 72" fill="none">
+              <polygon points="46.2,18.2 53.7,32.3 53.7,41.2 46.2,44.9" fill="#F6B632"/>
+              <polygon points="46.2,18.2 76.0,36.5 61.3,36.5 53.7,32.3" fill="#EC7E31"/>
+              <polygon points="61.3,36.5 76.0,36.5 53.7,49.6 53.7,41.2" fill="#D72652"/>
+              <polygon points="24.0,68.5 31.8,54.4 53.7,41.2 53.7,49.6" fill="#8E479B"/>
+              <polygon points="24.0,31.0 31.8,45.2 31.8,54.4 24.0,68.5" fill="#5C58A4"/>
+              <polygon points="46.2,54.2 53.7,58.8 53.7,67.7 46.2,81.8" fill="#6DB444"/>
+              <polygon points="53.7,67.7 61.3,63.5 76.0,63.5 46.2,81.8" fill="#267F43"/>
+              <polygon points="24.0,31.0 76.0,63.5 61.3,63.5 31.8,45.2" fill="#3C83C6"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="alfa-main-card">
+          <div class="alfa-amount-text">-__AMOUNT__ ₽</div>
+          <div class="alfa-fee-text">__ALFA_FEE_TEXT__</div>
+          <div class="alfa-recipient-text">__ALFA_RECIPIENT__</div>
+          <div class="alfa-sbp-desc">
+            В __ALFA_BANK_NAME__ через СБП по<br>номеру __ALFA_PHONE__
+          </div>
+        </div>
+
+        <div class="alfa-history-card">
+          <span class="alfa-hand-emoji">👉</span>
+          <div class="alfa-history-text">
+            История поможет вам отследить<br>все траты и контролировать<br>бюджет
+          </div>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+            <path d="M9 5L16 12L9 19" stroke="#a0a0a5" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <button class="alfa-done-btn">Готово</button>
+    </div>
+
+    <!-- ЭКРАН 3: Т-БАНК (Операция) -->
+    <div id="tbank-screen" class="__TBANK_ACTIVE__">
+      <div class="tbank-top">
+        <div class="tbank-logo">
+          <svg width="44" height="48" viewBox="0 0 44 48" fill="none">
+            <path d="M4 6H40V25C40 36.5 22 44 22 44C22 44 4 36.5 4 25V6Z" fill="white"/>
+            <path d="M13 14H31V19.5H25V32H19V19.5H13V14Z" fill="#212124"/>
+          </svg>
+        </div>
+
+        <div class="tbank-name">__RECIPIENT__</div>
+        <div class="tbank-category">Переводы</div>
+        <div class="tbank-amount">-__AMOUNT__ ₽</div>
+
+        <div class="tbank-status">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <circle cx="8" cy="8" r="7" fill="#b5bac1"/>
+            <path d="M8 4.5V8.5H11" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span>Обрабатываем операцию</span>
+        </div>
+
+        <div class="tbank-actions">
+          <div class="tbank-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2.5L14.9 8.6L21.6 9.5L16.7 14.2L17.9 20.9L12 17.7L6.1 20.9L7.3 14.2L2.4 9.5L9.1 8.6L12 2.5Z" fill="#428bf9"/>
+            </svg>
+            <span>Избранное</span>
+          </div>
+
+          <div class="tbank-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M14.5 4.5L19.5 9.5L16.5 12.5L11.5 7.5L14.5 4.5Z" fill="#428bf9"/>
+              <path d="M12.5 8.5L6.5 14.5L9.5 17.5L15.5 11.5" fill="#428bf9"/>
+              <rect x="4" y="18.5" width="10" height="2.5" rx="1.2" fill="#428bf9"/>
+            </svg>
+            <span>Оспорить</span>
+          </div>
+
+          <div class="tbank-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M10 6C7.2 6 5 8.7 5 12C5 15.3 7.2 18 10 18V6Z" fill="#428bf9"/>
+              <path d="M14 6C16.8 6 19 8.7 19 12C19 15.3 16.8 18 14 18V6Z" fill="#428bf9"/>
+            </svg>
+            <span>Разделить</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="tbank-card">
+        <div class="tbank-card-header">
+          <div class="tbank-card-title">Перевод</div>
+          <div class="tbank-card-link">Справка</div>
+        </div>
+
+        <div class="tbank-account-row">
+          <div class="tbank-ruble-icon">
+            <div class="tbank-ruble-inner">₽</div>
+          </div>
+          <div class="tbank-account-info">
+            <div class="tbank-account-name">Black</div>
+            <div class="tbank-account-balance">__BALANCE__ ₽</div>
+          </div>
+          <div class="tbank-chevron">›</div>
+        </div>
+      </div>
+
+      <div class="tbank-card">
+        <div class="tbank-card-title">Реквизиты</div>
+        <div class="tbank-req-label">Номер карты</div>
+        <div class="tbank-req-val">__MASKED_CARD__</div>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 3B: Т-БАНК (Квитанция) -->
+    <div id="tbank-receipt-screen" class="__TBANK_RECEIPT_ACTIVE__">
+      <div class="tbr-shield-wrap">
+        <svg width="44" height="48" viewBox="0 0 44 48" fill="none">
+          <path d="M3 5H41V25C41 37 22 45 22 45C22 45 3 37 3 25V5Z" fill="#FFDD2D"/>
+          <path d="M13.5 14H30.5V19H24.5V32H19.5V19H13.5V14Z" fill="#191C1F"/>
+        </svg>
+      </div>
+
+      <div class="tbr-date">__TBANK_REC_DATE__</div>
+
+      <div class="tbr-total-row">
+        <div class="tbr-total-label">Итого</div>
+        <div class="tbr-total-val">__AMOUNT__ ₽</div>
+      </div>
+
+      <div class="tbr-yellow-line"></div>
+
+      <div class="tbr-rows">
+        <div class="tbr-row">
+          <div class="tbr-key">Перевод</div>
+          <div class="tbr-val">Клиенту Т-Банка</div>
+        </div>
+        <div class="tbr-row">
+          <div class="tbr-key">Статус</div>
+          <div class="tbr-val">Успешно</div>
+        </div>
+        <div class="tbr-row">
+          <div class="tbr-key">Сумма</div>
+          <div class="tbr-val">__AMOUNT__ ₽</div>
+        </div>
+        <div class="tbr-row">
+          <div class="tbr-key">Карта получателя</div>
+          <div class="tbr-val">*__TBANK_REC_LAST4__</div>
+        </div>
+        <div class="tbr-row">
+          <div class="tbr-key">Получатель</div>
+          <div class="tbr-val">__RECIPIENT__</div>
+        </div>
+        <div class="tbr-row">
+          <div class="tbr-key">Описание операции</div>
+          <div class="tbr-val">Внутренний перевод на карту<br>__TBANK_REC_SPACED_CARD__</div>
+        </div>
+        <div class="tbr-row">
+          <div class="tbr-key">Отправитель</div>
+          <div class="tbr-val">__TBANK_REC_SENDER__</div>
+        </div>
+      </div>
+
+      <div class="tbr-stamp-area">
+        <div class="tbr-stamp-box">
+          <div class="tbr-stamp-title">АО «ТБАНК»</div>
+          <div class="tbr-stamp-line">БИК 044525974 ИНН 7710140679</div>
+          <div class="tbr-stamp-line">К/С 30101810145250000974</div>
+          <div class="tbr-stamp-line">ШАДРИНА Е. С.</div>
+        </div>
+        <!-- Векторный росчерк подписи поверх печати -->
+        <svg class="tbr-signature-svg" viewBox="0 0 180 80" fill="none">
+          <path d="M12 68 C 28 54, 46 32, 42 18 C 38 8, 22 22, 26 42 C 30 60, 48 56, 62 34 C 70 20, 62 12, 56 26 C 50 42, 66 54, 82 36 C 90 26, 84 18, 78 30 C 74 42, 88 52, 104 34 C 112 24, 106 18, 100 30 C 96 42, 112 52, 130 30 C 138 20, 132 14, 124 34 C 118 48, 110 68, 102 74 C 96 78, 106 58, 124 44 C 142 30, 162 24, 174 20"
+                stroke="#3b5675" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="tbr-yellow-line"></div>
+
+      <div class="tbr-footer">
+        <div class="tbr-receipt-num">Квитанция № __TBANK_REC_NUM__</div>
+        <div class="tbr-footer-note">По вопросам зачисления обращайтесь к получателю</div>
+        <div class="tbr-support">Служба поддержки fb@tbank.ru</div>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 4: Т-БАНК (2) -->
+    <div id="tbank2-screen" class="__TBANK2_ACTIVE__">
+      <div class="tbank2-header">
+        <div class="tbank2-date">__TBANK2_DATE__</div>
+        <div class="tbank2-close">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M1.5 1.5L12.5 12.5M12.5 1.5L1.5 12.5" stroke="#7c828a" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="tbank-top">
+        <div class="alfa-logo">
+          <svg width="100%" height="100%" viewBox="0 0 100 100" fill="none">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M45.2 22.4C46.3 19.6 47.8 18.5 50 18.5C52.2 18.5 53.7 19.6 54.8 22.4L70.5 61.5H61.6L58.1 52H41.9L38.4 61.5H29.5L45.2 22.4ZM50 28.2L44.4 44.2H55.6L50 28.2Z" fill="white"/>
+            <path d="M29.8 70.2H70.2V78.4H29.8V70.2Z" fill="white"/>
+          </svg>
+        </div>
+
+        <div class="tbank-name">__TBANK2_RECIPIENT__</div>
+        <div class="tbank-category">Переводы</div>
+        <div class="tbank2-amount">-__AMOUNT__ ₽</div>
+
+        <div class="tbank2-actions">
+          <div class="tbank2-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2.5L14.9 8.6L21.6 9.5L16.7 14.2L17.9 20.9L12 17.7L6.1 20.9L7.3 14.2L2.4 9.5L9.1 8.6L12 2.5Z" fill="#428bf9"/>
+            </svg>
+            <span>Избранное</span>
+          </div>
+
+          <div class="tbank2-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M13 5L20 12L13 19V14.5C7.5 14.5 4.5 16.5 3 20C4 14 7 9.5 13 9.5V5Z" fill="#428bf9"/>
+            </svg>
+            <span>Повторить</span>
+          </div>
+
+          <div class="tbank2-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="7.5" stroke="#428bf9" stroke-width="3"/>
+              <line x1="6" y1="18" x2="18" y2="6" stroke="#428bf9" stroke-width="3" stroke-linecap="round"/>
+            </svg>
+            <span>Не учитывать</span>
+          </div>
+
+          <div class="tbank2-action-btn">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M14.5 4.5L19.5 9.5L16.5 12.5L11.5 7.5L14.5 4.5Z" fill="#428bf9"/>
+              <path d="M12.5 8.5L6.5 14.5L9.5 17.5L15.5 11.5" fill="#428bf9"/>
+              <rect x="4" y="18.5" width="10" height="2.5" rx="1.2" fill="#428bf9"/>
+            </svg>
+            <span>Оспорить</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="tbank-card">
+        <div class="tbank-card-header">
+          <div class="tbank-card-title">Перевод</div>
+          <div class="tbank-card-link">Справка</div>
+        </div>
+
+        <div class="tbank-account-row">
+          <div class="tbank-ruble-icon">
+            <div class="tbank-ruble-inner">₽</div>
+          </div>
+          <div class="tbank-account-info">
+            <div class="tbank2-account-name">Black</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tbank-card">
+        <div class="tbank-card-title">Реквизиты</div>
+        <div class="tbank-req-label">Номер телефона</div>
+        <div class="tbank-req-val">__TBANK2_REQ__</div>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 5: ОЗОН БАНК -->
+    <div id="ozon-screen" class="__OZON_ACTIVE__">
+      <div class="ozon-card-top">
+        <div class="ozon-check-wrap">
+          <div class="ozon-badge">ozon<br>банк</div>
+          <svg width="32" height="24" viewBox="0 0 32 24" fill="none">
+            <path d="M3 12.5L11.5 21L29 3.5" stroke="#4da3ff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+
+        <div class="ozon-title">Перевод выполнен</div>
+        <div class="ozon-subtitle">По номеру карты</div>
+        <div class="ozon-amount">__AMOUNT__ ₽</div>
+      </div>
+
+      <div class="ozon-card-mid">
+        <div class="ozon-menu-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+            <path d="M6 3H18C19.1 3 20 3.9 20 5V21L17 19L14 21L12 19.5L10 21L7 19L4 21V5C4 3.9 4.9 3 6 3Z" fill="#4da3ff"/>
+            <line x1="8" y1="8" x2="16" y2="8" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+            <line x1="8" y1="12" x2="13" y2="12" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <span>Получить чек</span>
+        </div>
+
+        <div class="ozon-menu-item">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+            <rect x="3" y="5" width="15" height="12" rx="2" fill="#4da3ff"/>
+            <path d="M7 11L9.5 13.5L14 9" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M7 19H19C20.1 19 21 18.1 21 17V9" stroke="#4da3ff" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <span>Запомнить карту</span>
+        </div>
+      </div>
+
+      <div class="ozon-card-bottom">
+        <div class="ozon-section-title">Перевод</div>
+
+        <div class="ozon-field">
+          <div class="ozon-field-label">Сумма</div>
+          <div class="ozon-field-value">__AMOUNT__ ₽</div>
+        </div>
+
+        <div class="ozon-field">
+          <div class="ozon-field-label">Комиссия за перевод</div>
+          <div class="ozon-field-value">__FEE__ ₽</div>
+        </div>
+
+        <button class="ozon-main-btn">На главную</button>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 6: ОЗОН БАНК (2) -->
+    <div id="ozon2-screen" class="__OZON2_ACTIVE__">
+      <div class="ozon2-topbar">
+        <svg width="26" height="26" viewBox="18 14 64 72" fill="none" style="flex-shrink: 0;">
+          <polygon points="46.2,18.2 53.7,32.3 53.7,41.2 46.2,44.9" fill="#F6B632"/>
+          <polygon points="46.2,18.2 76.0,36.5 61.3,36.5 53.7,32.3" fill="#EC7E31"/>
+          <polygon points="61.3,36.5 76.0,36.5 53.7,49.6 53.7,41.2" fill="#D72652"/>
+          <polygon points="24.0,68.5 31.8,54.4 53.7,41.2 53.7,49.6" fill="#8E479B"/>
+          <polygon points="24.0,31.0 31.8,45.2 31.8,54.4 24.0,68.5" fill="#5C58A4"/>
+          <polygon points="46.2,54.2 53.7,58.8 53.7,67.7 46.2,81.8" fill="#6DB444"/>
+          <polygon points="53.7,67.7 61.3,63.5 76.0,63.5 46.2,81.8" fill="#267F43"/>
+          <polygon points="24.0,31.0 76.0,63.5 61.3,63.5 31.8,45.2" fill="#3C83C6"/>
+        </svg>
+
+        <div class="ozon2-topbar-title">Система быстрых платежей</div>
+
+        <div class="ozon2-close-btn">
+          <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+            <path d="M1.8 1.8L12.2 12.2M12.2 1.8L1.8 12.2" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="ozon2-ticket-wrap">
+        <div class="ozon2-sber-box">
+          <svg width="52" height="52" viewBox="0 0 52 52" fill="none">
+            <path d="M43.5 23.5C43.8 24.6 44 25.8 44 27C44 36.9 35.9 45 26 45C16.1 45 8 36.9 8 27C8 17.1 16.1 9 26 9C29.8 9 33.3 10.2 36.2 12.2" stroke="white" stroke-width="5.5" stroke-linecap="round"/>
+            <path d="M20 25.5L25.5 30.5L41.5 16.5" stroke="white" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <div class="ozon2-sber-check">
+            <svg width="12" height="10" viewBox="0 0 12 10" fill="none">
+              <path d="M1.5 5L4.5 8L10.5 2" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="ozon2-card">
+          <div class="ozon2-status">Успешно</div>
+          <div class="ozon2-amount">- __AMOUNT__ ₽</div>
+
+          <div class="ozon2-divider-wrap">
+            <div class="ozon2-notch-left"></div>
+            <div class="ozon2-dashed-line"></div>
+            <div class="ozon2-notch-right"></div>
+          </div>
+
+          <div class="ozon2-cat-pill">
+            <div class="ozon2-cat-ruble">₽</div>
+            <span class="ozon2-cat-text">Переводы</span>
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+              <path d="M11.2 2.2L13.8 4.8L5.2 13.4H2.6V10.8L11.2 2.2Z" fill="#7d848d"/>
+            </svg>
+          </div>
+
+          <div class="ozon2-bank-label">__OZON2_BANK__</div>
+          <div class="ozon2-recipient">__OZON2_RECIPIENT__</div>
+          <div class="ozon2-phone">__OZON2_PHONE__</div>
+        </div>
+
+        <div class="ozon2-promo-card">
+          <div class="ozon2-promo-icon">0%</div>
+          <div class="ozon2-promo-text">
+            Вы можете платить<br>частями: 6, 12 или 24 месяца
+          </div>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+            <path d="M9 6L15 12L9 18" stroke="#9ba5b4" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="ozon2-actions-row">
+        <div class="ozon2-action-item">
+          <div class="ozon2-action-box">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M12 5V2L8 6L12 10V7C15.3 7 18 9.7 18 13C18 16.3 15.3 19 12 19C8.7 19 6 16.3 6 13" stroke="#0088ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <span class="ozon2-action-label">Повторить</span>
+        </div>
+
+        <div class="ozon2-action-item">
+          <div class="ozon2-action-box">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <rect x="5" y="4" width="14" height="16" rx="3" fill="#0088ff"/>
+              <line x1="8" y1="9" x2="14" y2="9" stroke="#121c26" stroke-width="2" stroke-linecap="round"/>
+              <line x1="8" y1="13" x2="14" y2="13" stroke="#121c26" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <span class="ozon2-action-label">Документы</span>
+        </div>
+
+        <div class="ozon2-action-item">
+          <div class="ozon2-action-box">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M12 3.5L14.7 8.9L20.6 9.8L16.3 14L17.3 19.9L12 17.1L6.7 19.9L7.7 14L3.4 9.8L9.3 8.9L12 3.5Z" fill="#0088ff"/>
+            </svg>
+          </div>
+          <span class="ozon2-action-label">Шаблон</span>
+        </div>
+
+        <div class="ozon2-action-item">
+          <div class="ozon2-action-box">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M17 8H7L10 5M7 16H17L14 19" stroke="#0088ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <span class="ozon2-action-label">Автоплатёж</span>
+        </div>
+
+        <div class="ozon2-action-item">
+          <div class="ozon2-action-box">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M5 6C5 4.9 5.9 4 7 4H17C18.1 4 19 4.9 19 6V15C19 16.1 18.1 17 17 17H9L5 20V6Z" fill="#0088ff"/>
+              <line x1="12" y1="9" x2="12" y2="13" stroke="#121c26" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <span class="ozon2-action-label">Помощь</span>
+        </div>
+      </div>
+
+      <button class="ozon2-done-btn">Готово</button>
+    </div>
+
+    <!-- ЭКРАН 7: МОНОБАНК -->
+    <div id="mono-screen" class="__MONO_ACTIVE__">
+      <div class="mono-banner">
+        <svg class="mono-pattern" viewBox="0 0 400 80" fill="none">
+          <g stroke="white" stroke-width="1.5">
+            <rect x="20" y="28" width="22" height="15" rx="2" transform="rotate(-40 20 28)"/>
+            <line x1="23" y1="32" x2="36" y2="21"/>
+            <rect x="70" y="30" width="22" height="15" rx="2" transform="rotate(-40 70 30)"/>
+            <circle cx="84" cy="29" r="3"/>
+            <rect x="120" y="28" width="22" height="15" rx="2" transform="rotate(-40 120 28)"/>
+            <line x1="123" y1="32" x2="136" y2="21"/>
+            <rect x="265" y="30" width="22" height="15" rx="2" transform="rotate(-40 265 30)"/>
+            <circle cx="279" cy="29" r="3"/>
+            <rect x="315" y="28" width="22" height="15" rx="2" transform="rotate(-40 315 28)"/>
+            <line x1="318" y1="32" x2="331" y2="21"/>
+            <rect x="365" y="30" width="22" height="15" rx="2" transform="rotate(-40 365 30)"/>
+            <circle cx="379" cy="29" r="3"/>
+          </g>
+        </svg>
+      </div>
+
+      <div class="mono-top-section">
+        <div class="mono-avatar">
+          <svg width="38" height="38" viewBox="0 0 38 38" fill="none">
+            <rect x="4" y="11" width="24" height="17" rx="2.5" stroke="white" stroke-width="2"/>
+            <path d="M10 11V8.5C10 7.1 11.1 6 12.5 6H31.5C32.9 6 34 7.1 34 8.5V20.5C34 21.9 32.9 23 31.5 23H28" stroke="white" stroke-width="2"/>
+            <path d="M14 15.5L18.5 19.5L14 23.5" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+
+        <div class="mono-card-num">__MONO_CARD__</div>
+
+        <div class="mono-pill">
+          <span>Переказ на картку</span>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M8.8 1.2L10.8 3.2L3.5 10.5H1.5V8.5L8.8 1.2Z" fill="white"/>
+          </svg>
+        </div>
+
+        <div class="mono-date">__MONO_DATE__</div>
+
+        <div class="mono-amount">-__MONO_AMOUNT__ ₴</div>
+      </div>
+
+      <div class="mono-bottom-section">
+        <div class="mono-invite-card">
+          <div class="mono-invite-icon">
+            <svg width="20" height="16" viewBox="0 0 20 16" fill="none">
+              <rect x="1" y="1" width="18" height="14" rx="2" fill="white"/>
+              <path d="M1 3L10 8.5L19 3" stroke="#d8246e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <div class="mono-invite-text">Запросити отримувача до<br>monobank</div>
+        </div>
+
+        <div class="mono-row-card">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" style="flex-shrink: 0;">
+            <rect x="4" y="3" width="12" height="12" rx="2" stroke="#9b9b9e" stroke-width="1.6"/>
+            <line x1="7" y1="7" x2="13" y2="7" stroke="#9b9b9e" stroke-width="1.6" stroke-linecap="round"/>
+            <line x1="7" y1="10.5" x2="11" y2="10.5" stroke="#9b9b9e" stroke-width="1.6" stroke-linecap="round"/>
+            <line x1="8" y1="15" x2="8" y2="18" stroke="#9b9b9e" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+          <span class="mono-tags-text">Опис та #теги</span>
+        </div>
+
+        <div class="mono-row-card">
+          <div class="mono-wallet-icon">
+            <svg width="18" height="16" viewBox="0 0 18 16" fill="none">
+              <rect x="1" y="3" width="16" height="12" rx="2.5" fill="white"/>
+              <path d="M4 3V2.2C4 1.5 4.5 1 5.2 1H13.8C14.5 1 15 1.5 15 2.2V3" stroke="white" stroke-width="1.5"/>
+              <circle cx="13.5" cy="9" r="1.3" fill="#4942a4"/>
+            </svg>
+          </div>
+          <div class="mono-balance-info">
+            <div class="mono-balance-label">Залишок</div>
+            <div class="mono-balance-val">__MONO_BALANCE__ ₴</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 8: TELEGRAM WALLET -->
+    <div id="wallet-screen" class="__WALLET_ACTIVE__">
+      <div class="wallet-topbar">
+        <div class="wallet-topbar-left">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+            <path class="wallet-icon-stroke" d="M19 12H5M5 12L12 19M5 12L12 5" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <div class="wallet-topbar-title-wrap">
+            <span class="wallet-topbar-title">Walt (ранее Ко...</span>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" style="flex-shrink: 0;">
+              <path d="M12 2L14.8 4.5L18.5 4.2L19.5 7.8L22.5 10L21.2 13.5L22.5 17L19.5 19.2L18.5 22.8L14.8 22.5L12 25L9.2 22.5L5.5 22.8L4.5 19.2L1.5 17L2.8 13.5L1.5 10L4.5 7.8L5.5 4.2L9.2 4.5L12 2Z" fill="#4ea4f5"/>
+              <path d="M8.5 13.5L11 16L16 10.5" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+        </div>
+        <div class="wallet-topbar-right">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <path class="wallet-icon-stroke" d="M6 9L12 15L18 9" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <circle class="wallet-icon-fill" cx="12" cy="5" r="2" fill="white"/>
+            <circle class="wallet-icon-fill" cx="12" cy="12" r="2" fill="white"/>
+            <circle class="wallet-icon-fill" cx="12" cy="19" r="2" fill="white"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="wallet-card">
+        <div class="wallet-sent-row">
+          <div class="wallet-up-circle">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <path d="M7 11V3M7 3L3.5 6.5M7 3L10.5 6.5" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <div class="wallet-sent-title">Отправлено __WALLET_SHORT_ADDR__</div>
+        </div>
+
+        <div class="wallet-amount-row">
+          <span class="wallet-amount-val">__AMOUNT__</span>
+          <span class="wallet-amount-token">__WALLET_TOKEN__</span>
+        </div>
+
+        <div class="wallet-date">__WALLET_DATE__</div>
+      </div>
+
+      <div class="wallet-card-details">
+        <div class="wallet-details-header">Детали платежа</div>
+
+        <div class="wallet-field">
+          <div class="wallet-field-label">Статус</div>
+          <div class="wallet-field-val">Успешно</div>
+        </div>
+
+        <div class="wallet-field">
+          <div class="wallet-field-label">Отправлено</div>
+          <div class="wallet-address-val">__WALLET_FULL_ADDR__</div>
+        </div>
+
+        <div class="wallet-field">
+          <div class="wallet-field-label">Комиссия</div>
+          <div class="wallet-field-val">__WALLET_FEE__ __WALLET_TOKEN__</div>
+        </div>
+
+        <div class="wallet-explorer-link">Открыть в обозревателе</div>
+      </div>
+    </div>
+
+    <!-- ЭКРАН 9: ПРИОРБАНК -->
+    <div id="prior-screen" class="__PRIOR_ACTIVE__">
+      <div class="prior-topbar">
+        <div class="prior-title">Результат операции</div>
+      </div>
+
+      <div class="prior-center">
+        <div class="prior-icon-wrap">
+          <div class="prior-icon-inner">
+            <svg width="42" height="32" viewBox="0 0 32 24" fill="none">
+              <path d="M3.5 12L11.5 20L28.5 3.5" stroke="white" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+        </div>
+
+        <div class="prior-desc">__PRIOR_DESC__</div>
+        <div class="prior-amount">__PRIOR_AMOUNT__ __PRIOR_CURRENCY__</div>
+      </div>
+
+      <div class="prior-bottom">
+        <button class="prior-btn-receipt">Карт-чек</button>
+        <button class="prior-btn-close">Закрыть</button>
+      </div>
+    </div>
+
+  </div>
+
+</body>
+</html>
+"""
+
+
+class FakeBankTransferPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        try:
+            self.add_settings_menu_item(
+                text="Fake Bank Transfer",
+                icon="msg_payment_card",
+                on_click=self._on_main_menu_click
+            )
+        except AttributeError:
+            try:
+                from base_plugin import MenuItemType
+                self.add_menu_item(
+                    MenuItemType.SETTINGS,
+                    text="Fake Bank Transfer",
+                    icon="msg_payment_card",
+                    on_click=self._on_main_menu_click
+                )
+            except Exception:
+                pass
+
+    def on_plugin_unload(self):
+        pass
+
+    def _on_main_menu_click(self, *args):
+        try:
+            self.open_plugin_settings()
+        except Exception:
+            pass
+
+    def create_settings(self):
+        if not self.get_setting("amount", ""):
+            self._randomize_requisites()
+
+        bank_type = int(self.get_setting("bank_type", 0))
+        if bank_type == 6:
+            currency_symbol = "₴"
+        elif bank_type == 7:
+            currency_symbol = str(self.get_setting("wallet_token", "GRAM")).strip() or "GRAM"
+        elif bank_type == 8:
+            currency_symbol = str(self.get_setting("prior_currency", "BYN")).strip() or "BYN"
+        else:
+            currency_symbol = "₽"
+
+        settings_list = [
+            Header(text="Выбор банка и темы"),
+            Selector(
+                key="bank_type",
+                text="Банк",
+                default=0,
+                items=[
+                    "1: 🇷🇺 Сбер",
+                    "2: 🇷🇺 Альфа-Банк",
+                    "3: 🇷🇺 Т-Банк",
+                    "4: 🇷🇺 Т-Банк (2)",
+                    "5: 🇷🇺 Озон-Банк",
+                    "6: 🇷🇺 Озон-Банк (2)",
+                    "7: 🇺🇦 Монобанк",
+                    "8: Telegram Wallet",
+                    "9: 🇧🇾 Приорбанк"
+                ],
+                on_change=self.on_bank_change
+            ),
+            Selector(
+                key="theme_mode",
+                text="Тема чека",
+                default=0,
+                items=["По умолчанию", "Тёмная", "Светлая"]
+            ),
+            Divider(),
+            Header(text="Настройки выбранного банка"),
+            Input(
+                key="amount",
+                text=f"Сумма перевода ({currency_symbol})",
+                default=str(self.get_setting("amount", "")),
+                on_change=self.on_amount_change
+            )
+        ]
+
+        if bank_type == 0:
+            settings_list.append(
+                Input(
+                    key="sber_card",
+                    text="Номер карты получателя (последние 4 цифры)",
+                    default="7447"
+                )
+            )
+        elif bank_type == 1:
+            settings_list.extend([
+                Input(
+                    key="alfa_account",
+                    text="Счёт списания (последние 4 цифры)",
+                    default="9477"
+                ),
+                Input(
+                    key="alfa_recipient",
+                    text="Имя получателя",
+                    default="Нэсп без идентификации Д."
+                ),
+                Input(
+                    key="alfa_bank_name",
+                    text="Банк получателя",
+                    default="Озон Банк (Ozon)"
+                ),
+                Input(
+                    key="alfa_phone",
+                    text="Номер телефона получателя",
+                    default="+7 (963) 444-00-39"
+                ),
+                Input(
+                    key="alfa_fee_text",
+                    text="Текст комиссии",
+                    default="Без комиссии"
+                )
+            ])
+        elif bank_type == 2:
+            tbank_mode = int(self.get_setting("tbank_mode", 0))
+            settings_list.extend([
+                Selector(
+                    key="tbank_mode",
+                    text="Тип экрана",
+                    default=0,
+                    items=["Экран операции", "Квитанция (Официальный чек)"],
+                    on_change=self.on_tbank_mode_change
+                ),
+                Input(
+                    key="recipient",
+                    text="Имя получателя",
+                    default="Тимур Г."
+                ),
+                Input(
+                    key="tbank_card",
+                    text="Номер карты получателя",
+                    default="220039******7525"
+                )
+            ])
+
+            if tbank_mode == 0:
+                settings_list.append(
+                    Input(
+                        key="balance",
+                        text="Остаток на карте Black (₽)",
+                        default="3387,61",
+                        on_change=self.on_balance_change
+                    )
+                )
+            else:
+                settings_list.extend([
+                    Input(
+                        key="tbank_rec_date",
+                        text="Дата и время квитанции",
+                        default="02.11.2026 14:16:41"
+                    ),
+                    Input(
+                        key="tbank_rec_sender",
+                        text="Отправитель",
+                        default="Олег Огренич"
+                    ),
+                    Input(
+                        key="tbank_rec_num",
+                        text="Номер квитанции",
+                        default="1-104-590-944-194"
+                    )
+                ])
+        elif bank_type == 3:
+            settings_list.extend([
+                Input(
+                    key="tbank2_date",
+                    text="Дата сверху",
+                    default="20 марта • 17:53"
+                ),
+                Input(
+                    key="tbank2_recipient",
+                    text="Имя получателя",
+                    default="Михаил П."
+                ),
+                Input(
+                    key="tbank2_requisites",
+                    text="Реквизиты (Номер телефона)",
+                    default="+7 921 142-90-11"
+                )
+            ])
+        elif bank_type == 4:
+            settings_list.append(
+                Input(
+                    key="fee",
+                    text="Комиссия за перевод (₽)",
+                    default="99",
+                    on_change=self.on_fee_change
+                )
+            )
+        elif bank_type == 5:
+            settings_list.extend([
+                Input(
+                    key="ozon2_bank",
+                    text="Банк получателя",
+                    default="Сбербанк"
+                ),
+                Input(
+                    key="ozon2_recipient",
+                    text="Имя получателя",
+                    default="Андрей Игоревич Л."
+                ),
+                Input(
+                    key="ozon2_phone",
+                    text="Номер телефона получателя",
+                    default="+7 (951) 685-84-59"
+                )
+            ])
+        elif bank_type == 6:
+            settings_list.extend([
+                Input(
+                    key="mono_date",
+                    text="Дата перевода",
+                    default="25 листопада 2024, 13:50"
+                ),
+                Input(
+                    key="mono_balance",
+                    text="Залишок (₴)",
+                    default="91.04",
+                    on_change=self.on_mono_balance_change
+                ),
+                Input(
+                    key="mono_card",
+                    text="Номер карты получателя",
+                    default="516874****8224"
+                )
+            ])
+        elif bank_type == 7:
+            settings_list.extend([
+                Input(
+                    key="wallet_token",
+                    text="Валюта / Токен",
+                    default="GRAM",
+                    on_change=self.on_wallet_token_change
+                ),
+                Input(
+                    key="wallet_date",
+                    text="Дата перевода",
+                    default="30 октября в 14:58"
+                ),
+                Input(
+                    key="wallet_address",
+                    text="Адрес получателя",
+                    default="UQAM3AL6N2cpNjXKqoxzEA_L9kFJebk6yifeP3cCL8k-djsk"
+                ),
+                Input(
+                    key="wallet_fee",
+                    text="Комиссия",
+                    default="0,000513009"
+                )
+            ])
+        elif bank_type == 8:
+            prior_mode = int(self.get_setting("prior_mode", 0))
+            settings_list.extend([
+                Selector(
+                    key="prior_mode",
+                    text="Тип перевода",
+                    default=0,
+                    items=["По номеру карты", "По номеру договора"],
+                    on_change=self.on_prior_mode_change
+                ),
+                Input(
+                    key="prior_currency",
+                    text="Валюта (BYN, USD, RUB, EUR...)",
+                    default=str(self.get_setting("prior_currency", "BYN")),
+                    on_change=self.on_prior_currency_change
+                )
+            ])
+
+            if prior_mode == 0:
+                first6 = str(self.get_setting("prior_card_first6", "491698"))
+                last4 = str(self.get_setting("prior_card_last4", "7710"))
+                settings_list.extend([
+                    Input(
+                        key="prior_card_first6",
+                        text="Первые 6 цифр карты",
+                        default=first6,
+                        on_change=self.on_prior_first6_change
+                    ),
+                    Input(
+                        key="prior_card_last4",
+                        text="Последние 4 цифры карты",
+                        default=last4,
+                        on_change=self.on_prior_last4_change
+                    ),
+                    Text(
+                        text=f"Итоговая маска: {first6}******{last4}",
+                        icon="msg_info"
+                    )
+                ])
+            else:
+                settings_list.append(
+                    Input(
+                        key="prior_contract",
+                        text="Номер договора",
+                        default=str(self.get_setting("prior_contract", "0980063001196"))
+                    )
+                )
+
+        settings_list.extend([
+            Text(
+                text="Случайные настройки",
+                icon="msg_retry",
+                on_click=self.generate_random_data
+            ),
+            Divider(),
+            Header(text="Генерация и сохранение"),
+            Text(
+                text="Открыть чек перевода",
+                icon="msg_payment_card",
+                accent=True,
+                on_click=self.open_receipt
+            ),
+            Text(
+                text="Сохранить чек в галерею",
+                icon="msg_gallery",
+                accent=True,
+                on_click=self.save_receipt_to_gallery
+            ),
+            Divider(),
+            Text(
+                text="Plugin made by @morkxdddd & @flovnev",
+                icon="msg_info"
+            )
+        ])
+
+        return settings_list
+
+    def on_bank_change(self, *args):
+        if args and isinstance(args[0], int):
+            self.set_setting("bank_type", args[0])
+        self._randomize_requisites()
+        run_on_ui_thread(self._refresh_settings_screen)
+
+    def on_tbank_mode_change(self, *args):
+        if args and isinstance(args[0], int):
+            self.set_setting("tbank_mode", args[0])
+        run_on_ui_thread(self._refresh_settings_screen)
+
+    def on_prior_mode_change(self, *args):
+        if args and isinstance(args[0], int):
+            self.set_setting("prior_mode", args[0])
+        run_on_ui_thread(self._refresh_settings_screen)
+
+    def on_prior_currency_change(self, *args):
+        if args and isinstance(args[0], str):
+            clean_curr = "".join(ch for ch in args[0] if ch.isalnum()).upper() or "BYN"
+            self.set_setting("prior_currency", clean_curr)
+            run_on_ui_thread(self._refresh_settings_screen)
+
+    def on_prior_first6_change(self, *args):
+        if args and isinstance(args[0], str):
+            digits = "".join(ch for ch in args[0] if ch.isdigit())[:6]
+            self.set_setting("prior_card_first6", digits or "491698")
+            run_on_ui_thread(self._refresh_settings_screen)
+
+    def on_prior_last4_change(self, *args):
+        if args and isinstance(args[0], str):
+            digits = "".join(ch for ch in args[0] if ch.isdigit())[:4]
+            self.set_setting("prior_card_last4", digits or "7710")
+            run_on_ui_thread(self._refresh_settings_screen)
+
+    def on_amount_change(self, *args):
+        if args and isinstance(args[0], str):
+            bank_type = int(self.get_setting("bank_type", 0))
+            sep = "." if bank_type in (6, 8) else ","
+            self.set_setting("amount", format_spaces(args[0], decimal_sep=sep))
+
+    def on_fee_change(self, *args):
+        if args and isinstance(args[0], str):
+            self.set_setting("fee", format_spaces(args[0]))
+
+    def on_balance_change(self, *args):
+        if args and isinstance(args[0], str):
+            self.set_setting("balance", format_spaces(args[0]))
+
+    def on_mono_balance_change(self, *args):
+        if args and isinstance(args[0], str):
+            self.set_setting("mono_balance", format_spaces(args[0], decimal_sep="."))
+
+    def on_wallet_token_change(self, *args):
+        if args and isinstance(args[0], str):
+            self.set_setting("wallet_token", args[0].strip().upper() or "GRAM")
+            run_on_ui_thread(self._refresh_settings_screen)
+
+    def _randomize_requisites(self):
+        """Заполняет все настройки случайными значениями."""
+        now = datetime.now()
+        bank_type = int(self.get_setting("bank_type", 0))
+
+        rand_amount = str(random.randint(10, 500)) if bank_type == 8 else str(random.randint(100, 50000))
+        sep = "." if bank_type in (6, 8) else ","
+        self.set_setting("amount", format_spaces(rand_amount, decimal_sep=sep))
+
+        last4 = str(random.randint(1000, 9999))
+        name = random.choice(RANDOM_NAMES)
+        full_name = random.choice(RANDOM_FULL_NAMES)
+
+        self.set_setting("sber_card", last4)
+        self.set_setting("fee", random.choice(["0", "30", "45", "50", "99", "149"]))
+        self.set_setting("recipient", name)
+
+        ru_bin = random.choice(["220039", "220070", "220220", "427638", "553691"])
+        self.set_setting("tbank_card", f"{ru_bin}******{last4}")
+        bal_int = random.randint(450, 120000)
+        bal_kop = random.randint(0, 99)
+        self.set_setting("balance", format_spaces(f"{bal_int},{bal_kop:02d}"))
+
+        # Квитанция Т-Банка (1)
+        self.set_setting("tbank_rec_date", now.strftime("%d.%m.%Y %H:%M:%S"))
+        self.set_setting("tbank_rec_sender", random.choice(RANDOM_SENDERS))
+        r_p1 = random.randint(100, 999)
+        r_p2 = random.randint(100, 999)
+        r_p3 = random.randint(100, 999)
+        r_p4 = random.randint(100, 999)
+        self.set_setting("tbank_rec_num", f"1-{r_p1}-{r_p2}-{r_p3}-{r_p4}")
+
+        tb_day = random.randint(1, 28)
+        tb_month = random.randint(1, 12)
+        tb_hour = random.randint(0, 23)
+        tb_min = random.randint(0, 59)
+        ru_date = f"{tb_day} {RU_MONTHS[tb_month]} • {tb_hour:02d}:{tb_min:02d}"
+        self.set_setting("tbank2_date", ru_date)
+        self.set_setting("tbank2_recipient", name)
+        p1 = random.randint(900, 999)
+        p2 = random.randint(100, 999)
+        p3 = random.randint(10, 99)
+        p4 = random.randint(10, 99)
+        self.set_setting("tbank2_requisites", f"+7 {p1} {p2}-{p3}-{p4}")
+
+        self.set_setting("ozon2_bank", "Сбербанк")
+        self.set_setting("ozon2_recipient", full_name)
+        self.set_setting("ozon2_phone", f"+7 ({p1}) {p2}-{p3:02d}-{p4:02d}")
+
+        m_day = random.randint(1, 28)
+        m_month = random.randint(1, 12)
+        m_year = random.choice([now.year - 1, now.year])
+        m_hour = random.randint(0, 23)
+        m_min = random.randint(0, 59)
+        ua_date = f"{m_day} {UA_MONTHS[m_month]} {m_year}, {m_hour:02d}:{m_min:02d}"
+        self.set_setting("mono_date", ua_date)
+        m_bal_int = random.randint(50, 45000)
+        m_bal_kop = random.randint(0, 99)
+        self.set_setting("mono_balance", format_spaces(f"{m_bal_int}.{m_bal_kop:02d}", decimal_sep="."))
+        ua_bin = random.choice(["516874", "444111", "537541"])
+        self.set_setting("mono_card", f"{ua_bin}****{last4}")
+
+        w_token = random.choice(["GRAM", "USDT"])
+        w_day = random.randint(1, 28)
+        w_month = random.randint(1, 12)
+        w_hour = random.randint(0, 23)
+        w_min = random.randint(0, 59)
+        chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+        rand_addr = "UQ" + "".join(random.choice(chars) for _ in range(46))
+        self.set_setting("wallet_token", w_token)
+        self.set_setting("wallet_address", rand_addr)
+        self.set_setting("wallet_date", f"{w_day} {RU_MONTHS[w_month]} в {w_hour:02d}:{w_min:02d}")
+        self.set_setting("wallet_fee", f"0,000{random.randint(100000, 999999)}")
+
+        alfa_acc = str(random.randint(1000, 9999))
+        self.set_setting("alfa_account", alfa_acc)
+        self.set_setting("alfa_recipient", random.choice(RANDOM_NAMES + ["Нэсп без идентификации Д."]))
+        self.set_setting("alfa_bank_name", "Озон Банк (Ozon)")
+        self.set_setting("alfa_phone", f"+7 ({p1}) {p2}-{p3:02d}-{p4:02d}")
+        self.set_setting("alfa_fee_text", "Без комиссии")
+
+        # Приорбанк
+        by_bin = "491698"
+        self.set_setting("prior_currency", "BYN")
+        self.set_setting("prior_card_first6", by_bin)
+        self.set_setting("prior_card_last4", last4)
+        self.set_setting("prior_contract", f"09800{random.randint(10000000, 99999999)}")
+
+    def generate_random_data(self, *args):
+        """Генерирует случайные настройки и обновляет экран без уведомления."""
+        self._randomize_requisites()
+        run_on_ui_thread(self._refresh_settings_screen)
+
+    def _refresh_settings_screen(self):
+        """Принудительно перестраивает экран настроек плагина на месте без перезахода."""
+        try:
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+
+            scroll_pos = 0
+            scroll_offset = 0
+            lm = None
+            if hasattr(fragment, "listView") and fragment.listView:
+                lm = fragment.listView.getLayoutManager()
+                if lm and hasattr(lm, "findFirstVisibleItemPosition"):
+                    scroll_pos = lm.findFirstVisibleItemPosition()
+                    first_view = lm.findViewByPosition(scroll_pos)
+                    if first_view:
+                        scroll_offset = first_view.getTop()
+
+            parent_layout = fragment.getParentLayout() if hasattr(fragment, "getParentLayout") else None
+            if parent_layout and hasattr(parent_layout, "rebuildAllFragmentViews"):
+                parent_layout.rebuildAllFragmentViews(True, True)
+                if hasattr(fragment, "listView") and fragment.listView:
+                    new_lm = fragment.listView.getLayoutManager()
+                    if new_lm and hasattr(new_lm, "scrollToPositionWithOffset"):
+                        new_lm.scrollToPositionWithOffset(scroll_pos, scroll_offset)
+                return
+
+            if hasattr(fragment, "listView") and fragment.listView:
+                adapter = fragment.listView.getAdapter()
+                if adapter:
+                    if hasattr(adapter, "update"):
+                        adapter.update(False)
+                    if hasattr(adapter, "notifyDataSetChanged"):
+                        adapter.notifyDataSetChanged()
+        except Exception:
+            pass
+
+    def open_receipt(self, *args):
+        run_on_ui_thread(self._show_dialog)
+
+    def save_receipt_to_gallery(self, *args):
+        run_on_ui_thread(self._save_receipt_silently)
+
+    def _resolve_is_dark(self, bank_type: int) -> bool:
+        theme_mode = int(self.get_setting("theme_mode", 0))
+        if theme_mode == 1:
+            return True
+        if theme_mode == 2:
+            return False
+        # По умолчанию: квитанция Т-Банка (1) светлая, остальные по своим дефолтам
+        if bank_type == 2 and int(self.get_setting("tbank_mode", 0)) == 1:
+            return False
+        return bank_type in (0, 1, 4, 5, 6, 7, 8)
+
+    def _build_receipt_html_and_colors(self, no_anim: bool = False):
+        if not self.get_setting("amount", ""):
+            self._randomize_requisites()
+
+        bank_type = int(self.get_setting("bank_type", 0))
+        tbank_mode = int(self.get_setting("tbank_mode", 0))
+        is_dark = self._resolve_is_dark(bank_type)
+        theme_class = "theme-dark" if is_dark else "theme-light"
+        if no_anim:
+            theme_class += " no-anim"
+
+        raw_amount = str(self.get_setting("amount", "1000"))
+        amount = format_spaces(raw_amount)
+        mono_amount = format_mono_amount(raw_amount)
+
+        fee = format_spaces(self.get_setting("fee", "99"))
+        recipient = str(self.get_setting("recipient", "Тимур Г.")).strip()
+        balance = format_spaces(self.get_setting("balance", "3387,61"))
+
+        tbank2_date = str(self.get_setting("tbank2_date", "20 марта • 17:53")).strip()
+        tbank2_recipient = str(self.get_setting("tbank2_recipient", "Михаил П.")).strip()
+        tbank2_req = str(self.get_setting("tbank2_requisites", "+7 921 142-90-11")).strip()
+
+        ozon2_bank = str(self.get_setting("ozon2_bank", "Сбербанк")).strip()
+        ozon2_recipient = str(self.get_setting("ozon2_recipient", "Андрей Игоревич Л.")).strip()
+        ozon2_phone = str(self.get_setting("ozon2_phone", "+7 (951) 685-84-59")).strip()
+
+        mono_date = str(self.get_setting("mono_date", "25 листопада 2024, 13:50")).strip()
+        mono_balance = format_spaces(self.get_setting("mono_balance", "91.04"), decimal_sep=".")
+        raw_mono_card = str(self.get_setting("mono_card", "516874****8224")).replace(" ", "")
+        if "*" in raw_mono_card:
+            mono_card = raw_mono_card
+        elif len(raw_mono_card) >= 10:
+            mono_card = raw_mono_card[:6] + "****" + raw_mono_card[-4:]
+        elif len(raw_mono_card) >= 4:
+            mono_card = "516874****" + raw_mono_card[-4:]
+        else:
+            mono_card = "516874****8224"
+
+        wallet_token = str(self.get_setting("wallet_token", "GRAM")).strip() or "GRAM"
+        wallet_date = str(self.get_setting("wallet_date", "30 октября в 14:58")).strip()
+        wallet_full_addr = str(
+            self.get_setting("wallet_address", "UQAM3AL6N2cpNjXKqoxzEA_L9kFJebk6yifeP3cCL8k-djsk")
+        ).strip()
+        if len(wallet_full_addr) > 10:
+            wallet_short_addr = f"{wallet_full_addr[:4]}...{wallet_full_addr[-4:]}"
+        else:
+            wallet_short_addr = wallet_full_addr
+        wallet_fee = str(self.get_setting("wallet_fee", "0,000513009")).strip()
+
+        raw_alfa_acc = str(self.get_setting("alfa_account", "9477")).replace(" ", "")
+        alfa_account = raw_alfa_acc[-4:] if len(raw_alfa_acc) >= 4 else (raw_alfa_acc or "9477")
+        alfa_recipient = str(self.get_setting("alfa_recipient", "Нэсп без идентификации Д.")).strip()
+        alfa_bank_name = str(self.get_setting("alfa_bank_name", "Озон Банк (Ozon)")).strip()
+        alfa_phone = str(self.get_setting("alfa_phone", "+7 (963) 444-00-39")).strip()
+        alfa_fee_text = str(self.get_setting("alfa_fee_text", "Без комиссии")).strip()
+
+        raw_sber_card = str(self.get_setting("sber_card", "7447")).replace(" ", "")
+        last4 = raw_sber_card[-4:] if len(raw_sber_card) >= 4 else (raw_sber_card or "7447")
+
+        raw_tbank_card = str(self.get_setting("tbank_card", "220039******7525")).replace(" ", "")
+        if "*" in raw_tbank_card:
+            masked_card = raw_tbank_card
+        elif len(raw_tbank_card) >= 10:
+            masked_card = raw_tbank_card[:6] + "******" + raw_tbank_card[-4:]
+        elif len(raw_tbank_card) >= 4:
+            masked_card = "220039******" + raw_tbank_card[-4:]
+        else:
+            masked_card = "220039******7525"
+
+        # Данные для квитанции Т-Банка (1)
+        tbank_rec_last4, tbank_rec_spaced_card = format_tbank_receipt_card(raw_tbank_card)
+        tbank_rec_date = str(self.get_setting("tbank_rec_date", "02.11.2026 14:16:41")).strip()
+        tbank_rec_sender = str(self.get_setting("tbank_rec_sender", "Олег Огренич")).strip()
+        tbank_rec_num = str(self.get_setting("tbank_rec_num", "1-104-590-944-194")).strip()
+
+        # Данные Приорбанка
+        prior_currency = str(self.get_setting("prior_currency", "BYN")).strip() or "BYN"
+        prior_mode = int(self.get_setting("prior_mode", 0))
+        if bank_type == 8:
+            if prior_mode == 0:
+                p_first6 = str(self.get_setting("prior_card_first6", "491698")).strip() or "491698"
+                p_last4 = str(self.get_setting("prior_card_last4", "7710")).strip() or "7710"
+                p_card = f"{p_first6}******{p_last4}"
+                prior_desc = f"Перевод на карту {p_card}"
+                prior_amount = format_mono_amount(raw_amount)
+            else:
+                p_contract = str(self.get_setting("prior_contract", "0980063001196")).strip()
+                prior_desc = f"Пополнение карточки {p_contract}"
+                prior_amount = format_spaces(raw_amount, decimal_sep=",")
+                if "," not in prior_amount:
+                    prior_amount = f"{prior_amount},00"
+        else:
+            prior_desc = ""
+            prior_amount = ""
+
+        if bank_type == 0:
+            bg_hex = "#111113" if is_dark else "#f3f4f6"
+            status_hex = "#111113" if is_dark else "#f3f4f6"
+            nav_hex = "#1d1a22" if is_dark else "#ffffff"
+        elif bank_type == 1:
+            bg_hex = "#0b0b0c" if is_dark else "#f2f3f7"
+            status_hex = "#0b0b0c" if is_dark else "#f2f3f7"
+            nav_hex = "#0b0b0c" if is_dark else "#f2f3f7"
+        elif bank_type == 2 and tbank_mode == 1:
+            bg_hex = "#141518" if is_dark else "#ffffff"
+            status_hex = "#141518" if is_dark else "#ffffff"
+            nav_hex = "#141518" if is_dark else "#ffffff"
+        elif bank_type == 4:
+            bg_hex = "#0f1115" if is_dark else "#f0f2f5"
+            status_hex = "#181b20" if is_dark else "#ffffff"
+            nav_hex = "#181b20" if is_dark else "#ffffff"
+        elif bank_type == 5:
+            bg_hex = "#08192e" if is_dark else "#eef2f7"
+            status_hex = "#0d2942" if is_dark else "#eef2f7"
+            nav_hex = "#08192e" if is_dark else "#eef2f7"
+        elif bank_type == 6:
+            bg_hex = "#18171c" if is_dark else "#f2f3f7"
+            status_hex = "#4e47a6"
+            nav_hex = "#18171c" if is_dark else "#f2f3f7"
+        elif bank_type == 7:
+            bg_hex = "#000000" if is_dark else "#f2f2f7"
+            status_hex = "#000000" if is_dark else "#f2f2f7"
+            nav_hex = "#000000" if is_dark else "#f2f2f7"
+        elif bank_type == 8:
+            bg_hex = "#18191c" if is_dark else "#f7f8fa"
+            status_hex = "#18191c" if is_dark else "#f7f8fa"
+            nav_hex = "#18191c" if is_dark else "#f7f8fa"
+        else:
+            bg_hex = "#0f1012" if is_dark else "#f5f6f8"
+            status_hex = "#0f1012" if is_dark else "#ffffff"
+            nav_hex = "#0f1012" if is_dark else "#f5f6f8"
+
+        bg_color = Color.parseColor(bg_hex)
+        status_color = Color.parseColor(status_hex)
+        nav_color = Color.parseColor(nav_hex)
+
+        html = (
+            HTML_TEMPLATE
+            .replace("__BG_HEX__", bg_hex)
+            .replace("__THEME_CLASS__", theme_class)
+            .replace("__SBER_ACTIVE__", "active-screen" if bank_type == 0 else "")
+            .replace("__ALFA_ACTIVE__", "active-screen" if bank_type == 1 else "")
+            .replace("__TBANK_ACTIVE__", "active-screen" if (bank_type == 2 and tbank_mode == 0) else "")
+            .replace("__TBANK_RECEIPT_ACTIVE__", "active-screen" if (bank_type == 2 and tbank_mode == 1) else "")
+            .replace("__TBANK2_ACTIVE__", "active-screen" if bank_type == 3 else "")
+            .replace("__OZON_ACTIVE__", "active-screen" if bank_type == 4 else "")
+            .replace("__OZON2_ACTIVE__", "active-screen" if bank_type == 5 else "")
+            .replace("__MONO_ACTIVE__", "active-screen" if bank_type == 6 else "")
+            .replace("__WALLET_ACTIVE__", "active-screen" if bank_type == 7 else "")
+            .replace("__PRIOR_ACTIVE__", "active-screen" if bank_type == 8 else "")
+            .replace("__AMOUNT__", amount)
+            .replace("__MONO_AMOUNT__", mono_amount)
+            .replace("__LAST4__", last4)
+            .replace("__MASKED_CARD__", masked_card)
+            .replace("__TBANK_REC_DATE__", tbank_rec_date)
+            .replace("__TBANK_REC_LAST4__", tbank_rec_last4)
+            .replace("__TBANK_REC_SPACED_CARD__", tbank_rec_spaced_card)
+            .replace("__TBANK_REC_SENDER__", tbank_rec_sender)
+            .replace("__TBANK_REC_NUM__", tbank_rec_num)
+            .replace("__FEE__", fee)
+            .replace("__RECIPIENT__", recipient)
+            .replace("__BALANCE__", balance)
+            .replace("__TBANK2_DATE__", tbank2_date)
+            .replace("__TBANK2_RECIPIENT__", tbank2_recipient)
+            .replace("__TBANK2_REQ__", tbank2_req)
+            .replace("__OZON2_BANK__", ozon2_bank)
+            .replace("__OZON2_RECIPIENT__", ozon2_recipient)
+            .replace("__OZON2_PHONE__", ozon2_phone)
+            .replace("__MONO_DATE__", mono_date)
+            .replace("__MONO_BALANCE__", mono_balance)
+            .replace("__MONO_CARD__", mono_card)
+            .replace("__WALLET_TOKEN__", wallet_token)
+            .replace("__WALLET_DATE__", wallet_date)
+            .replace("__WALLET_FULL_ADDR__", wallet_full_addr)
+            .replace("__WALLET_SHORT_ADDR__", wallet_short_addr)
+            .replace("__WALLET_FEE__", wallet_fee)
+            .replace("__ALFA_ACCOUNT__", alfa_account)
+            .replace("__ALFA_RECIPIENT__", alfa_recipient)
+            .replace("__ALFA_BANK_NAME__", alfa_bank_name)
+            .replace("__ALFA_PHONE__", alfa_phone)
+            .replace("__ALFA_FEE_TEXT__", alfa_fee_text)
+            .replace("__PRIOR_DESC__", prior_desc)
+            .replace("__PRIOR_AMOUNT__", prior_amount)
+            .replace("__PRIOR_CURRENCY__", prior_currency)
+        )
+
+        return html, bg_color, status_color, nav_color
+
+    def _capture_webview_to_gallery(self, activity, webview):
+        try:
+            width = webview.getWidth()
+            height = webview.getHeight()
+            if width <= 0 or height <= 0:
+                return
+
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            canvas = Canvas(bitmap)
+            webview.draw(canvas)
+
+            filename = f"Receipt_{int(datetime.now().timestamp())}.png"
+            values = ContentValues()
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FakeTransfers")
+
+            resolver = activity.getContentResolver()
+            uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if uri:
+                out_stream = resolver.openOutputStream(uri)
+                if out_stream:
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out_stream)
+                    out_stream.flush()
+                    out_stream.close()
+                Toast.makeText(
+                    activity,
+                    "Чек сохранён в галерею (Pictures/FakeTransfers)",
+                    Toast.LENGTH_SHORT
+                ).show()
+        except Exception as e:
+            Toast.makeText(activity, f"Ошибка сохранения: {e}", Toast.LENGTH_SHORT).show()
+
+    def _save_receipt_silently(self):
+        """Рендерит и сохраняет чек в галерею в фоновом режиме без показа окна."""
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+        activity = fragment.getParentActivity()
+        if not activity:
+            return
+
+        try:
+            WebView.enableSlowWholeDocumentDraw()
+        except Exception:
+            pass
+
+        html, bg_color, _, _ = self._build_receipt_html_and_colors(no_anim=True)
+
+        metrics = activity.getResources().getDisplayMetrics()
+        width = int(metrics.widthPixels) if metrics and metrics.widthPixels > 0 else 1080
+        height = int(metrics.heightPixels) if metrics and metrics.heightPixels > 0 else 2400
+
+        webview = WebView(activity)
+        webview.setBackgroundColor(bg_color)
+        webview.setLayerType(View.LAYER_TYPE_SOFTWARE, None)
+        ws = webview.getSettings()
+        ws.setJavaScriptEnabled(False)
+        ws.setDomStorageEnabled(False)
+
+        wrapper = FrameLayout(activity)
+        wrapper.setAlpha(0.0)
+        wrapper.setClickable(False)
+        wrapper.setFocusable(False)
+        wrapper.addView(webview, FrameLayout.LayoutParams(width, height))
+
+        decor_view = activity.getWindow().getDecorView() if activity.getWindow() else None
+        attached_parent = None
+        if isinstance(decor_view, ViewGroup):
+            decor_view.addView(wrapper, ViewGroup.LayoutParams(width, height))
+            attached_parent = decor_view
+
+        spec_w = View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY)
+        spec_h = View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+        webview.measure(spec_w, spec_h)
+        webview.layout(0, 0, width, height)
+
+        webview.loadDataWithBaseURL(None, html, "text/html", "UTF-8", None)
+
+        def _finish_silent_capture():
+            try:
+                webview.measure(spec_w, spec_h)
+                webview.layout(0, 0, width, height)
+                self._capture_webview_to_gallery(activity, webview)
+            finally:
+                try:
+                    if attached_parent is not None:
+                        attached_parent.removeView(wrapper)
+                    webview.destroy()
+                except Exception:
+                    pass
+
+        threading.Timer(0.4, lambda: run_on_ui_thread(_finish_silent_capture)).start()
+
+    def _show_dialog(self):
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+        activity = fragment.getParentActivity()
+        if not activity:
+            return
+
+        html, bg_color, status_color, nav_color = self._build_receipt_html_and_colors(no_anim=False)
+
+        dialog = Dialog(activity, 16973834)
+        window = dialog.getWindow()
+        if window:
+            window.requestFeature(Window.FEATURE_NO_TITLE)
+            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+            window.setStatusBarColor(status_color)
+            window.setNavigationBarColor(nav_color)
+            window.setBackgroundDrawable(ColorDrawable(bg_color))
+
+        webview = WebView(activity)
+        webview.setBackgroundColor(bg_color)
+        webview.setLayerType(View.LAYER_TYPE_SOFTWARE, None)
+        ws = webview.getSettings()
+        ws.setJavaScriptEnabled(False)
+        ws.setDomStorageEnabled(False)
+
+        try:
+            from java import dynamic_proxy
+
+            class LongClickSaver(dynamic_proxy(View.OnLongClickListener)):
+                def __init__(self, plugin_ref, act, wv):
+                    super().__init__()
+                    self.plugin_ref = plugin_ref
+                    self.act = act
+                    self.wv = wv
+
+                def onLongClick(self, v):
+                    self.plugin_ref._capture_webview_to_gallery(self.act, self.wv)
+                    return True
+
+            webview.setOnLongClickListener(LongClickSaver(self, activity, webview))
+        except Exception:
+            pass
+
+        webview.loadDataWithBaseURL(None, html, "text/html", "UTF-8", None)
+        dialog.setContentView(webview)
+        dialog.show()
